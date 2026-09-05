@@ -3,34 +3,47 @@ vscode_panel.py  -  small always-on-top control panel for your VS Code windows (
 
 Buttons:
     Hide all / Max all / Tile
-    Max: <project>   one per open VS Code window, maximises it and brings it to front
+    Max: <project>   one per open VS Code window, maximises it and brings it to front,
+                     with a status light fed by claude_hook.py:
+                     grey idle / amber Claude working / green Claude finished / red Claude needs you
 
-The button list refreshes itself every 2 s as windows open/close.
+Tile also raises all windows and (optionally) wheel-scrolls the chat panel in each to the bottom,
+with a progress bar while it does so.  The button list refreshes every 2 s as windows open/close.
 Run with pythonw.exe (or rename to .pyw) to avoid a console window.
 """
 
 import base64
 import ctypes
+import json
 import ctypes.wintypes as wt
 import math
 import os
 import re
 import tempfile
 import tkinter as tk
+from tkinter import ttk
 
 user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
 
 # ---- config ----------------------------------------------------------------
 TITLE_SUFFIX = "Visual Studio Code"      # "Visual Studio Code - Insiders" for Insiders builds
 WINDOW_CLASS = "Chrome_WidgetWin_1"
 MONITOR = 0                              # 0 = primary
-REFRESH_MS = 2000
+REFRESH_MS = 1000
+STATUS_DIR = os.path.join(tempfile.gettempdir(), "vscode_panel_status")   # written by claude_hook.py
+STATUS_COLORS = {"idle": "#b0b0b0", "working": "#e6a700", "done": "#2ecc40", "waiting": "#ff3b30"}
+SCROLL_TO_BOTTOM = True                  # after tiling, wheel-scroll the chat panel in each window to the end
+SCROLL_POINTS = [(0.80, 0.50)]           # (x, y) as fraction of window size: where the chat panel lives
+SCROLL_NOTCHES = 40                      # wheel clicks per point; more = reaches the bottom of longer chats
+SCROLL_STEP_MS = 15                      # gap between wheel clicks; too fast and the webview coalesces them
+SETTLE_MS = 300                          # wait after resizing before scrolling, so VS Code has re-laid out
 SHOW_TITLEBAR = True                     # False = frameless; drag with the hand bar, right-click it to quit
 # ----------------------------------------------------------------------------
 
 SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE = 3, 6, 9
-SWP_NOZORDER, SWP_NOACTIVATE = 0x0004, 0x0010
 GW_OWNER = 4
+MOUSEEVENTF_MOVE, MOUSEEVENTF_WHEEL = 0x0001, 0x0800
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -101,10 +114,36 @@ def icon_path():
     return path
 
 
+# ---- win32 structs ---------------------------------------------------------
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [("length", wt.UINT), ("flags", wt.UINT), ("showCmd", wt.UINT),
+                ("ptMinPosition", POINT), ("ptMaxPosition", POINT),
+                ("rcNormalPosition", wt.RECT)]
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", wt.DWORD),
+                ("dwFlags", wt.DWORD), ("time", wt.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [("type", wt.DWORD), ("mi", MOUSEINPUT), ("_pad", ctypes.c_byte * 8)]
+
+
+def send_mouse(flags, data=0, dx=0, dy=0):
+    inp = INPUT(type=0, mi=MOUSEINPUT(dx, dy, data & 0xFFFFFFFF, flags, 0, None))
+    user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+
+
 EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
 SPLIT = re.compile(r"\s[-\u2013\u2014]\s")   # " - ", " – ", " — "
 
 
+# ---- window discovery ------------------------------------------------------
 def vscode_windows():
     """[(hwnd, title)] for every top-level VS Code window."""
     found = []
@@ -161,8 +200,26 @@ def work_area():
 
 
 def bring_to_front(hwnd):
-    # our own button click gives this process foreground rights, so this normally succeeds
+    """SetForegroundWindow that works on other processes' windows (AttachThreadInput trick)."""
+    fg = user32.GetForegroundWindow()
+    fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+    me = kernel32.GetCurrentThreadId()
+    if fg_thread and fg_thread != me:
+        user32.AttachThreadInput(me, fg_thread, True)
+    user32.BringWindowToTop(hwnd)
     user32.SetForegroundWindow(hwnd)
+    if fg_thread and fg_thread != me:
+        user32.AttachThreadInput(me, fg_thread, False)
+
+
+def place(hwnd, x, y, w, h):
+    """Restore (if minimised/maximised) and move/resize in one atomic call."""
+    wp = WINDOWPLACEMENT()
+    wp.length = ctypes.sizeof(WINDOWPLACEMENT)
+    user32.GetWindowPlacement(hwnd, ctypes.byref(wp))
+    wp.showCmd = SW_RESTORE
+    wp.rcNormalPosition = wt.RECT(x, y, x + w, y + h)
+    user32.SetWindowPlacement(hwnd, ctypes.byref(wp))
 
 
 # ---- actions ---------------------------------------------------------------
@@ -177,13 +234,19 @@ def max_all():
     for h, _ in vscode_windows():
         user32.ShowWindow(h, SW_MAXIMIZE)
     if prev:
-        user32.SetForegroundWindow(prev)
+        bring_to_front(prev)
+
+
+def maximize(hwnd):
+    user32.ShowWindow(hwnd, SW_MAXIMIZE)
+    bring_to_front(hwnd)
 
 
 def tile():
+    """Grid the windows and raise them all. Returns the window list for the scroll phase."""
     wins = vscode_windows()
     if not wins:
-        return
+        return []
     n = len(wins)
     cols = math.ceil(math.sqrt(n))
     rows = math.ceil(n / cols)
@@ -191,14 +254,50 @@ def tile():
     cw, ch = W // cols, H // rows
     for i, (h, _) in enumerate(wins):
         r, c = divmod(i, cols)
-        user32.ShowWindow(h, SW_RESTORE)
-        user32.SetWindowPos(h, 0, x0 + c * cw, y0 + r * ch, cw, ch,
-                            SWP_NOZORDER | SWP_NOACTIVATE)
+        place(h, x0 + c * cw, y0 + r * ch, cw, ch)
+    for h, _ in wins:                      # raise each in turn; last one ends up focused
+        bring_to_front(h)
+    return wins
 
 
-def maximize(hwnd):
-    user32.ShowWindow(hwnd, SW_MAXIMIZE)
-    bring_to_front(hwnd)
+def scroll_steps(wins):
+    """Generator: one wheel click per step, moving the cursor into each window's chat panel first."""
+    for h, _ in wins:
+        rc = wt.RECT()
+        user32.GetWindowRect(h, ctypes.byref(rc))
+        for fx, fy in SCROLL_POINTS:
+            x = rc.left + int((rc.right - rc.left) * fx)
+            y = rc.top + int((rc.bottom - rc.top) * fy)
+            user32.SetCursorPos(x, y)
+            send_mouse(MOUSEEVENTF_MOVE, dx=1, dy=0)    # real move event so the webview sees a hover
+            send_mouse(MOUSEEVENTF_MOVE, dx=-1, dy=0)
+            yield
+            for _ in range(SCROLL_NOTCHES):
+                send_mouse(MOUSEEVENTF_WHEEL, data=-120)
+                yield
+
+
+def read_statuses():
+    """{project name: state} from the files claude_hook.py writes."""
+    out = {}
+    if not os.path.isdir(STATUS_DIR):
+        return out
+    for fn in os.listdir(STATUS_DIR):
+        try:
+            with open(os.path.join(STATUS_DIR, fn)) as f:
+                d = json.load(f)
+            out[d["project"]] = d["state"]
+        except Exception:
+            pass
+    return out
+
+
+def clear_status(project):
+    safe = re.sub(r"[^\w.-]", "_", project)
+    try:
+        os.remove(os.path.join(STATUS_DIR, safe + ".json"))
+    except OSError:
+        pass
 
 
 # ---- UI --------------------------------------------------------------------
@@ -226,38 +325,98 @@ class Panel(tk.Tk):
 
         top = tk.Frame(self)
         top.pack(fill="x")
-        for text, fn in (("Hide all", hide_all), ("Max all", max_all), ("Tile", tile)):
-            tk.Button(top, text=text, width=9, command=fn).pack(side="left", padx=2)
+        self.buttons = []
+        for text, fn in (("Hide all", hide_all), ("Max all", max_all), ("Tile", self.tile)):
+            b = tk.Button(top, text=text, width=9, command=fn)
+            b.pack(side="left", padx=2)
+            self.buttons.append(b)
+
+        self.progress = ttk.Progressbar(self, mode="determinate")
+        self.progress.pack(fill="x", pady=(6, 0))
 
         self.list = tk.Frame(self)
         self.list.pack(fill="x", pady=(6, 0))
         self._sig = None
+        self._busy = False
         self.refresh()
 
+    # -- tile with scroll-to-bottom phase
+    def tile(self):
+        if self._busy:
+            return
+        wins = tile()
+        if not wins or not SCROLL_TO_BOTTOM:
+            return
+        self._busy = True
+        self._set_buttons("disabled")
+        self._saved = POINT()
+        user32.GetCursorPos(ctypes.byref(self._saved))
+        total = len(wins) * len(SCROLL_POINTS) * (SCROLL_NOTCHES + 1)
+        self.progress.configure(maximum=total, value=0)
+        self._steps = scroll_steps(wins)
+        self.after(SETTLE_MS, self._scroll_tick)
+
+    def _scroll_tick(self):
+        try:
+            next(self._steps)
+            self.progress.step(1)
+            self.after(SCROLL_STEP_MS, self._scroll_tick)
+        except StopIteration:
+            user32.SetCursorPos(self._saved.x, self._saved.y)
+            self.progress.configure(value=0)
+            self._set_buttons("normal")
+            self._busy = False
+
+    def _set_buttons(self, state):
+        for b in self.buttons + self.list.winfo_children():
+            if isinstance(b, tk.Button):
+                b.configure(state=state)
+
+    # -- drag bar
     def _drag_start(self, e):
         self._dx, self._dy = e.x_root - self.winfo_x(), e.y_root - self.winfo_y()
 
     def _drag_move(self, e):
         self.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
 
+    # -- per-window buttons
     def refresh(self):
         wins = vscode_windows()
         sig = tuple(wins)
-        if sig != self._sig:
+        if sig != self._sig and not self._busy:
             self._sig = sig
             for w in self.list.winfo_children():
                 w.destroy()
+            self.rows = {}                      # project -> indicator label
             seen = {}
             for h, t in wins:
-                name = project_name(t)
+                proj = project_name(t)
+                name = proj
                 seen[name] = seen.get(name, 0) + 1
                 if seen[name] > 1:
                     name = f"{name} ({seen[name]})"
-                tk.Button(self.list, text=f"Max: {name}", anchor="w",
-                          command=lambda h=h: maximize(h)).pack(fill="x", pady=1)
+                row = tk.Frame(self.list)
+                row.pack(fill="x", pady=1)
+                light = tk.Label(row, text="\u25cf", font=("Segoe UI", 14),
+                                 fg=STATUS_COLORS["idle"], width=2)
+                light.pack(side="left")
+                tk.Button(row, text=f"Max: {name}", anchor="w",
+                          command=lambda h=h, p=proj: self.focus_window(h, p)).pack(side="left", fill="x", expand=True)
+                self.rows[proj] = light
             if not wins:
                 tk.Label(self.list, text="no VS Code windows").pack()
+        self.update_lights()
         self.after(REFRESH_MS, self.refresh)
+
+    def focus_window(self, hwnd, project):
+        maximize(hwnd)
+        clear_status(project)           # you've looked at it; light goes back to idle
+        self.update_lights()
+
+    def update_lights(self):
+        states = read_statuses()
+        for proj, light in getattr(self, "rows", {}).items():
+            light.configure(fg=STATUS_COLORS.get(states.get(proj, "idle"), STATUS_COLORS["idle"]))
 
 
 if __name__ == "__main__":
