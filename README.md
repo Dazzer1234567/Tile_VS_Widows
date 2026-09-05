@@ -49,16 +49,15 @@ The light alone is passive — you still have to look at the panel. So `update_l
 |---|---|
 | `NOTIFY_SOUND` | `winsound.MessageBeep` — asterisk for *finished*, exclamation for *needs you* |
 | `NOTIFY_TOAST` | A Windows notification via `Shell_NotifyIconW` (`NIM_MODIFY` + `NIF_INFO`), reading `Claude Code — <project>: finished`. **Off by default** — the popup in the corner is intrusive, and the tinted row already says the same thing. No tray icon is registered while it is off. |
-| `NOTIFY_FLASH_TASKBAR` | `FlashWindowEx` with `FLASHW_TIMERNOFG`, so the panel's taskbar button flashes until you bring it to the foreground |
-| `NOTIFY_BLINK_ROW` | The whole row flashes every `BLINK_MS` until you click that window's Max button |
+| `NOTIFY_FLASH_TASKBAR` | `FlashWindowEx` with `FLASHW_TIMERNOFG`, so the panel's taskbar button flashes until you bring it to the foreground. **Off by default** — nothing about the panel should blink. |
 
 Details that matter:
 
 - The toast needs a tray icon to come from, so `Tray` registers one lazily on the first alert (using the same embedded `.ico`) and removes it on quit — closing via the window's X or right-clicking the drag bar both go through `close()`, so no ghost icon is left behind.
 - `_states` is seeded from disk in `__init__`, so a status file left over from a previous run doesn't fire an alert the moment the panel starts.
 - Only changes *into* an alert state fire; `working` → `working` is silent, and re-reading the same `done` doesn't re-alert.
-- `working` tints the row steadily; only the alert states (`done`, `waiting`) flash, so a flashing row always means it wants you.
-- Clicking Max deletes the status file, which clears the alert, stops the flash and stops the taskbar flash.
+- **Nothing blinks.** Every row colour is steady; the panel is meant to be read out of the corner of your eye, and movement there pulls focus rather than informing. The four states are amber (working), green (stopped, not yet looked at), red (waiting on you) and unfilled (nothing to report, or you have opened it since).
+- "Not yet looked at" needs no extra bookkeeping: the status file *is* that state. Clicking Max deletes it, which is what returns the row to unfilled.
 - `rows` maps a project to a *list* of rows. Two windows can share a folder name, and the hook writes one status file per name, so both rows must show that one state.
 - `user32.LoadImageW.restype` / `LoadIconW.restype` are set explicitly — without that the returned `HICON` is truncated to 32 bits on 64-bit Python and the tray icon silently fails to register.
 
@@ -87,7 +86,7 @@ Restart the VS Code windows after editing settings so the extension picks the ho
 - Drag bar: the `✋` row at the top moves the panel. `SHOW_TITLEBAR = False` makes it frameless (right-click the hand to quit).
 
 ## Config knobs (top of `vscode_panel.py`)
-`TITLE_SUFFIX`, `MONITOR`, `REFRESH_MS`, `SCROLL_TO_BOTTOM`, `SCROLL_POINTS`, `SCROLL_NOTCHES`, `SCROLL_STEP_MS`, `SETTLE_MS`, `SHOW_TITLEBAR`, `STATUS_COLORS`, `NOTIFY_ON`, `NOTIFY_SOUND`, `NOTIFY_TOAST`, `NOTIFY_FLASH_TASKBAR`, `NOTIFY_BLINK_ROW`, `BLINK_MS`.
+`TITLE_SUFFIX`, `MONITOR`, `REFRESH_MS`, `SCROLL_TO_BOTTOM`, `SCROLL_POINTS`, `SCROLL_NOTCHES`, `SCROLL_STEP_MS`, `SETTLE_MS`, `SHOW_TITLEBAR`, `STATUS_COLORS`, `NOTIFY_ON`, `NOTIFY_SOUND`, `NOTIFY_TOAST`, `NOTIFY_FLASH_TASKBAR`.
 
 ## Status / open issues
 

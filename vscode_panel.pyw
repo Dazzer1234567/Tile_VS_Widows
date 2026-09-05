@@ -7,9 +7,13 @@ Buttons:
                      The whole row is tinted by claude_hook.py's status:
                      plain idle / amber Claude working / green Claude finished / red Claude needs you
 
-When a window turns green (Claude finished) or red (Claude needs you) the panel notifies you:
-a system sound, a tray notification, a flashing taskbar button, and a blinking dot until you
-click that window's Max button.  See the NOTIFY_* knobs below.
+Row colours, all steady - nothing in the panel blinks:
+    amber   Claude is working
+    green   Claude has stopped and you have not looked at that window yet
+    red     Claude is waiting on you (a permission prompt or similar)
+    none    nothing to report, or you have opened that window since it finished
+Clicking a Max button opens the window and clears its colour.  A sound also plays when a
+window turns green or red; see the NOTIFY_* knobs below.
 
 Tile also raises all windows and (optionally) wheel-scrolls the chat panel in each to the bottom,
 with a progress bar while it does so.  The button list refreshes every 2 s as windows open/close.
@@ -42,9 +46,7 @@ STATUS_COLORS = {"idle": None, "working": "#f0b429", "done": "#3ad35a", "waiting
 NOTIFY_ON = ("done", "waiting")          # states that raise an alert; set to () to stay silent
 NOTIFY_SOUND = True                      # play a system sound
 NOTIFY_TOAST = False                     # Windows tray notification popup; off - the row and the sound are enough
-NOTIFY_FLASH_TASKBAR = True              # flash the panel's taskbar button until you look at the panel
-NOTIFY_BLINK_ROW = True                  # flash that window's whole row until you click its Max button
-BLINK_MS = 450                           # blink half-period
+NOTIFY_FLASH_TASKBAR = False             # flash the panel's taskbar button; off - nothing here should blink
 SCROLL_TO_BOTTOM = True                  # after tiling, wheel-scroll the chat panel in each window to the end
 SCROLL_POINTS = [(0.80, 0.50)]           # (x, y) as fraction of window size: where the chat panel lives
 SCROLL_NOTCHES = 40                      # wheel clicks per point; more = reaches the bottom of longer chats
@@ -445,8 +447,6 @@ class Panel(tk.Tk):
         # notifications: seed from what is already on disk so a status file left
         # over from a previous run does not fire the moment the panel starts
         self._states = read_statuses()
-        self._alerted = set()               # projects with an alert you have not acknowledged
-        self._blink = False
         self._bg = self.cget("bg")          # what an idle row looks like
         self._hwnd = self.panel_hwnd()
         self._tray = Tray(self._hwnd)
@@ -454,7 +454,6 @@ class Panel(tk.Tk):
         self.bind("<FocusIn>", lambda e: self.stop_flash())
 
         self.refresh()
-        self._blink_tick()
 
     def panel_hwnd(self):
         self.update_idletasks()
@@ -540,7 +539,6 @@ class Panel(tk.Tk):
         maximize(hwnd)
         clear_status(project)           # you've looked at it; the row goes back to plain
         self._states.pop(project, None)
-        self._alerted.discard(project)
         self.stop_flash()
         self.update_lights()
 
@@ -550,18 +548,14 @@ class Panel(tk.Tk):
             if state in NOTIFY_ON and self._states.get(proj) != state:
                 self.alert(proj, state)
         self._states = states
-        self._alerted &= set(states)            # a cleared status cancels its alert
         for proj, widgets in getattr(self, "rows", {}).items():
             colour = STATUS_COLORS.get(states.get(proj, "idle")) or self._bg
-            if NOTIFY_BLINK_ROW and self._blink and proj in self._alerted:
-                colour = self._bg                       # the off half of the flash
             for row, btn in widgets:
                 row.configure(bg=colour)
                 btn.configure(bg=colour, activebackground=colour)
 
     def alert(self, project, state):
         """A window just changed to a state worth interrupting you for."""
-        self._alerted.add(project)
         if NOTIFY_SOUND:
             play_alert(state)
         if NOTIFY_TOAST:
@@ -574,12 +568,6 @@ class Panel(tk.Tk):
         if NOTIFY_FLASH_TASKBAR:
             flash_taskbar(self._hwnd, False)
 
-    def _blink_tick(self):
-        """Flash the rows of unacknowledged alerts on and off."""
-        if self._alerted or self._blink:
-            self._blink = bool(self._alerted) and not self._blink
-            self.update_lights()
-        self.after(BLINK_MS, self._blink_tick)
 
 
 if __name__ == "__main__":
