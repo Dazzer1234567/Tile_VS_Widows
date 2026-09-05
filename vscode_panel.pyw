@@ -420,6 +420,10 @@ class Panel(tk.Tk):
         grip = tk.Label(self, text="\u270b", font=("Segoe UI Emoji", 12),
                         cursor="fleur", bg="#d9d9d9")
         grip.pack(fill="x", pady=(0, 6))
+        # twice the natural height, so it is an easy target to grab.  Derived from
+        # reqheight rather than a pixel constant so it still doubles at any DPI or font size.
+        self.update_idletasks()
+        grip.pack_configure(ipady=grip.winfo_reqheight() // 2)
         grip.bind("<ButtonPress-1>", self._drag_start)
         grip.bind("<B1-Motion>", self._drag_move)
         grip.bind("<Button-3>", lambda e: self.close())

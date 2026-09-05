@@ -84,7 +84,7 @@ Restart the VS Code windows after editing settings so the extension picks the ho
 - Top row order is **Tile / Max all / Hide all**, Tile first because it is the one used most. The buttons `pack` with `expand=True` rather than a fixed `width`: on a button carrying an image, Tk reads `width` as pixels rather than characters, so an explicit width would size the three inconsistently.
 - The Tile button carries the four-black-squares logo to the right of its label (`compound="right"`). `logo_image()` draws it into a `PhotoImage` with `put()` rather than loading a file, so the panel stays a single script; unpainted pixels stay transparent, letting the button background through.
 - Icon: a 2×2 black-squares `.ico` is embedded as base64 and written to `%TEMP%` on first run. `SetCurrentProcessExplicitAppUserModelID` is called so the taskbar shows it instead of the Python icon.
-- Drag bar: the `✋` row at the top moves the panel. `SHOW_TITLEBAR = False` makes it frameless (right-click the hand to quit).
+- Drag bar: the `✋` row at the top moves the panel. It is padded to twice its natural height to be an easy target; the padding is derived from the label's `reqheight` rather than a pixel constant, so it still doubles at any DPI or font size. `SHOW_TITLEBAR = False` makes it frameless (right-click the hand to quit).
 
 ## Config knobs (top of `vscode_panel.py`)
 `TITLE_SUFFIX`, `MONITOR`, `REFRESH_MS`, `SCROLL_TO_BOTTOM`, `SCROLL_POINTS`, `SCROLL_NOTCHES`, `SCROLL_STEP_MS`, `SETTLE_MS`, `SHOW_TITLEBAR`, `STATUS_COLORS`, `NOTIFY_ON`, `NOTIFY_SOUND`, `NOTIFY_TOAST`, `NOTIFY_FLASH_TASKBAR`.
