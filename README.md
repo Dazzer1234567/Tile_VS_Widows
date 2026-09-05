@@ -42,6 +42,24 @@ There is no API to tell the Claude Code webview to scroll. Instead, after `SETTL
 
 It reads the hook JSON from stdin, takes `basename(cwd)` as the project, and writes `%TEMP%\vscode_panel_status\<project>.json`. The panel polls that directory every `REFRESH_MS` and colours the `●` next to the matching Max button. Clicking the Max button deletes the status file (light back to grey).
 
+### Notifications
+The light alone is passive — you still have to look at the panel. So `update_lights()` also watches for *transitions*: when a project's state changes into one of `NOTIFY_ON` (default `done` and `waiting`), `alert()` fires four ways, each independently switchable:
+
+| Knob | What it does |
+|---|---|
+| `NOTIFY_SOUND` | `winsound.MessageBeep` — asterisk for *finished*, exclamation for *needs you* |
+| `NOTIFY_TOAST` | A Windows notification via `Shell_NotifyIconW` (`NIM_MODIFY` + `NIF_INFO`), reading `Claude Code — <project>: finished` |
+| `NOTIFY_FLASH_TASKBAR` | `FlashWindowEx` with `FLASHW_TIMERNOFG`, so the panel's taskbar button flashes until you bring it to the foreground |
+| `NOTIFY_BLINK_LIGHT` | The dot blinks every `BLINK_MS` until you click that window's Max button |
+
+Details that matter:
+
+- The toast needs a tray icon to come from, so `Tray` registers one lazily on the first alert (using the same embedded `.ico`) and removes it on quit — closing via the window's X or right-clicking the drag bar both go through `close()`, so no ghost icon is left behind.
+- `_states` is seeded from disk in `__init__`, so a status file left over from a previous run doesn't fire an alert the moment the panel starts.
+- Only changes *into* an alert state fire; `working` → `working` is silent, and re-reading the same `done` doesn't re-alert.
+- Clicking Max deletes the status file, which clears the alert, stops the blink and stops the taskbar flash.
+- `user32.LoadImageW.restype` / `LoadIconW.restype` are set explicitly — without that the returned `HICON` is truncated to 32 bits on 64-bit Python and the tray icon silently fails to register.
+
 Hook config (double the backslashes in JSON):
 ```json
 {
@@ -59,7 +77,7 @@ Restart the VS Code windows after editing settings so the extension picks the ho
 - Drag bar: the `✋` row at the top moves the panel. `SHOW_TITLEBAR = False` makes it frameless (right-click the hand to quit).
 
 ## Config knobs (top of `vscode_panel.py`)
-`TITLE_SUFFIX`, `MONITOR`, `REFRESH_MS`, `SCROLL_TO_BOTTOM`, `SCROLL_POINTS`, `SCROLL_NOTCHES`, `SCROLL_STEP_MS`, `SETTLE_MS`, `SHOW_TITLEBAR`, `STATUS_COLORS`.
+`TITLE_SUFFIX`, `MONITOR`, `REFRESH_MS`, `SCROLL_TO_BOTTOM`, `SCROLL_POINTS`, `SCROLL_NOTCHES`, `SCROLL_STEP_MS`, `SETTLE_MS`, `SHOW_TITLEBAR`, `STATUS_COLORS`, `NOTIFY_ON`, `NOTIFY_SOUND`, `NOTIFY_TOAST`, `NOTIFY_FLASH_TASKBAR`, `NOTIFY_BLINK_LIGHT`, `BLINK_MS`.
 
 ## Status / open issues
 
@@ -67,4 +85,5 @@ Restart the VS Code windows after editing settings so the extension picks the ho
 - Scroll-to-bottom: **not yet verified** after the rewrite to `SendInput` + spaced notches. Earlier version (SetCursorPos + rapid `mouse_event`) did not work — likely because no hover event reached the webview and the events were coalesced. If still failing, check that `SCROLL_POINTS` actually lands on the chat panel in a tiled window, and consider raising `SCROLL_NOTCHES`.
 - Tile sometimes only raised one window in the earlier version; the `SetWindowPlacement` + `AttachThreadInput` rewrite is intended to fix this — **verify**.
 - Status lights: **not yet tested** end-to-end. Matching is by folder name; multi-root workspaces show the workspace name in the title, so they won't match — would need keying by something else (e.g. the hook's `cwd` vs. the window's workspace path via the VS Code extension API, or session_id).
-- Possible extension: flash the light or the whole panel when a window turns green; hide status files older than N hours.
+- Notifications (sound / toast / taskbar flash / blinking dot): the plumbing is tested — transitions fire correctly, the tray icon registers and is removed on quit, a pre-existing status file does not alert at startup — but only with a synthetic status file. **Not yet confirmed end-to-end from a real Claude Code hook**, which depends on the hook config above being live.
+- Possible extension: hide status files older than N hours; a "mute" toggle on the panel itself.

@@ -7,6 +7,10 @@ Buttons:
                      with a status light fed by claude_hook.py:
                      grey idle / amber Claude working / green Claude finished / red Claude needs you
 
+When a window turns green (Claude finished) or red (Claude needs you) the panel notifies you:
+a system sound, a tray notification, a flashing taskbar button, and a blinking dot until you
+click that window's Max button.  See the NOTIFY_* knobs below.
+
 Tile also raises all windows and (optionally) wheel-scrolls the chat panel in each to the bottom,
 with a progress bar while it does so.  The button list refreshes every 2 s as windows open/close.
 Run with pythonw.exe (or rename to .pyw) to avoid a console window.
@@ -21,6 +25,7 @@ import os
 import re
 import tempfile
 import tkinter as tk
+import winsound
 from tkinter import ttk
 
 user32 = ctypes.windll.user32
@@ -33,6 +38,12 @@ MONITOR = 0                              # 0 = primary
 REFRESH_MS = 1000
 STATUS_DIR = os.path.join(tempfile.gettempdir(), "vscode_panel_status")   # written by claude_hook.py
 STATUS_COLORS = {"idle": "#b0b0b0", "working": "#e6a700", "done": "#2ecc40", "waiting": "#ff3b30"}
+NOTIFY_ON = ("done", "waiting")          # states that raise an alert; set to () to stay silent
+NOTIFY_SOUND = True                      # play a system sound
+NOTIFY_TOAST = True                      # Windows tray notification ("Claude Code - <project>: finished")
+NOTIFY_FLASH_TASKBAR = True              # flash the panel's taskbar button until you look at the panel
+NOTIFY_BLINK_LIGHT = True                # blink that window's dot until you click its Max button
+BLINK_MS = 450                           # blink half-period
 SCROLL_TO_BOTTOM = True                  # after tiling, wheel-scroll the chat panel in each window to the end
 SCROLL_POINTS = [(0.80, 0.50)]           # (x, y) as fraction of window size: where the chat panel lives
 SCROLL_NOTCHES = 40                      # wheel clicks per point; more = reaches the bottom of longer chats
@@ -44,6 +55,11 @@ SHOW_TITLEBAR = True                     # False = frameless; drag with the hand
 SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE = 3, 6, 9
 GW_OWNER = 4
 MOUSEEVENTF_MOVE, MOUSEEVENTF_WHEEL = 0x0001, 0x0800
+FLASHW_STOP, FLASHW_ALL, FLASHW_TIMERNOFG = 0x0, 0x3, 0xC
+NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
+NIF_ICON, NIF_TIP, NIF_INFO = 0x02, 0x04, 0x10
+NIIF_INFO, IDI_APPLICATION = 0x1, 32512
+IMAGE_ICON, LR_LOADFROMFILE, LR_DEFAULTSIZE = 1, 0x0010, 0x0040
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -138,6 +154,23 @@ def send_mouse(flags, data=0, dx=0, dy=0):
     inp = INPUT(type=0, mi=MOUSEINPUT(dx, dy, data & 0xFFFFFFFF, flags, 0, None))
     user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
+
+class FLASHWINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wt.UINT), ("hwnd", wt.HWND), ("dwFlags", wt.DWORD),
+                ("uCount", wt.UINT), ("dwTimeout", wt.DWORD)]
+
+
+class NOTIFYICONDATA(ctypes.Structure):
+    _fields_ = [("cbSize", wt.DWORD), ("hWnd", wt.HWND), ("uID", wt.UINT), ("uFlags", wt.UINT),
+                ("uCallbackMessage", wt.UINT), ("hIcon", wt.HICON), ("szTip", wt.WCHAR * 128),
+                ("dwState", wt.DWORD), ("dwStateMask", wt.DWORD), ("szInfo", wt.WCHAR * 256),
+                ("uVersion", wt.UINT), ("szInfoTitle", wt.WCHAR * 64), ("dwInfoFlags", wt.DWORD),
+                ("guidItem", ctypes.c_byte * 16), ("hBalloonIcon", wt.HICON)]
+
+
+# HANDLE-returning calls must say so, or the value is truncated on 64-bit
+user32.LoadImageW.restype = wt.HANDLE
+user32.LoadIconW.restype = wt.HICON
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
 SPLIT = re.compile(r"\s[-\u2013\u2014]\s")   # " - ", " – ", " — "
@@ -300,6 +333,60 @@ def clear_status(project):
         pass
 
 
+# ---- notifications ---------------------------------------------------------
+def flash_taskbar(hwnd, on=True):
+    """Flash the panel's taskbar button; FLASHW_TIMERNOFG stops once it is foreground."""
+    fw = FLASHWINFO(ctypes.sizeof(FLASHWINFO), wt.HWND(hwnd),
+                    (FLASHW_ALL | FLASHW_TIMERNOFG) if on else FLASHW_STOP, 0, 0)
+    user32.FlashWindowEx(ctypes.byref(fw))
+
+
+def play_alert(state):
+    winsound.MessageBeep(winsound.MB_ICONASTERISK if state == "done"
+                         else winsound.MB_ICONEXCLAMATION)
+
+
+class Tray:
+    """A tray icon, used only as somewhere for balloon/toast notifications to come from."""
+
+    def __init__(self, hwnd):
+        self.hwnd = hwnd
+        self.added = False
+
+    def _nid(self, flags):
+        nid = NOTIFYICONDATA()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATA)
+        nid.hWnd = wt.HWND(self.hwnd)
+        nid.uID = 1
+        nid.uFlags = flags
+        return nid
+
+    def _add(self):
+        nid = self._nid(NIF_ICON | NIF_TIP)
+        nid.szTip = "VS Code panel"
+        try:
+            nid.hIcon = user32.LoadImageW(None, icon_path(), IMAGE_ICON, 0, 0,
+                                          LR_LOADFROMFILE | LR_DEFAULTSIZE)
+        except Exception:
+            nid.hIcon = user32.LoadIconW(None, IDI_APPLICATION)
+        self.added = bool(ctypes.windll.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)))
+        return self.added
+
+    def notify(self, title, text):
+        if not self.added and not self._add():
+            return
+        nid = self._nid(NIF_INFO)
+        nid.szInfoTitle = title[:63]
+        nid.szInfo = text[:255]
+        nid.dwInfoFlags = NIIF_INFO
+        ctypes.windll.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+
+    def remove(self):
+        if self.added:
+            ctypes.windll.shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid(0)))
+            self.added = False
+
+
 # ---- UI --------------------------------------------------------------------
 class Panel(tk.Tk):
     def __init__(self):
@@ -321,7 +408,7 @@ class Panel(tk.Tk):
         grip.pack(fill="x", pady=(0, 6))
         grip.bind("<ButtonPress-1>", self._drag_start)
         grip.bind("<B1-Motion>", self._drag_move)
-        grip.bind("<Button-3>", lambda e: self.destroy())
+        grip.bind("<Button-3>", lambda e: self.close())
 
         top = tk.Frame(self)
         top.pack(fill="x")
@@ -338,7 +425,30 @@ class Panel(tk.Tk):
         self.list.pack(fill="x", pady=(6, 0))
         self._sig = None
         self._busy = False
+
+        # notifications: seed from what is already on disk so a status file left
+        # over from a previous run does not fire the moment the panel starts
+        self._states = read_statuses()
+        self._alerted = set()               # projects with an alert you have not acknowledged
+        self._blink = False
+        self._hwnd = self.panel_hwnd()
+        self._tray = Tray(self._hwnd)
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<FocusIn>", lambda e: self.stop_flash())
+
         self.refresh()
+        self._blink_tick()
+
+    def panel_hwnd(self):
+        self.update_idletasks()
+        try:
+            return int(self.wm_frame(), 16)     # the top-level frame, not Tk's client window
+        except Exception:
+            return user32.GetParent(self.winfo_id()) or self.winfo_id()
+
+    def close(self):
+        self._tray.remove()
+        self.destroy()
 
     # -- tile with scroll-to-bottom phase
     def tile(self):
@@ -411,12 +521,45 @@ class Panel(tk.Tk):
     def focus_window(self, hwnd, project):
         maximize(hwnd)
         clear_status(project)           # you've looked at it; light goes back to idle
+        self._states.pop(project, None)
+        self._alerted.discard(project)
+        self.stop_flash()
         self.update_lights()
 
     def update_lights(self):
         states = read_statuses()
+        for proj, state in states.items():
+            if state in NOTIFY_ON and self._states.get(proj) != state:
+                self.alert(proj, state)
+        self._states = states
+        self._alerted &= set(states)            # a cleared status cancels its alert
         for proj, light in getattr(self, "rows", {}).items():
-            light.configure(fg=STATUS_COLORS.get(states.get(proj, "idle"), STATUS_COLORS["idle"]))
+            if NOTIFY_BLINK_LIGHT and self._blink and proj in self._alerted:
+                light.configure(fg=light.master.cget("bg"))
+            else:
+                light.configure(fg=STATUS_COLORS.get(states.get(proj, "idle"), STATUS_COLORS["idle"]))
+
+    def alert(self, project, state):
+        """A window just changed to a state worth interrupting you for."""
+        self._alerted.add(project)
+        if NOTIFY_SOUND:
+            play_alert(state)
+        if NOTIFY_TOAST:
+            self._tray.notify("Claude Code",
+                              "%s: %s" % (project, "finished" if state == "done" else "needs you"))
+        if NOTIFY_FLASH_TASKBAR:
+            flash_taskbar(self._hwnd, True)
+
+    def stop_flash(self):
+        if NOTIFY_FLASH_TASKBAR:
+            flash_taskbar(self._hwnd, False)
+
+    def _blink_tick(self):
+        """Toggle the dots of unacknowledged alerts on and off."""
+        if self._alerted or self._blink:
+            self._blink = bool(self._alerted) and not self._blink
+            self.update_lights()
+        self.after(BLINK_MS, self._blink_tick)
 
 
 if __name__ == "__main__":
