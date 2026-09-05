@@ -4,6 +4,9 @@ claude_hook.py  -  Claude Code hook: record per-project status for vscode_panel.
 Reads the hook JSON from stdin and writes %TEMP%\\vscode_panel_status\\<project>.json
 so the panel can show a light next to the matching "Max: <project>" button.
 
+The event name is taken from argv[1] when given, so the hook still works if the
+payload ever omits "hook_event_name"; each registration passes its own event.
+
 Add to ~/.claude/settings.json (use double backslashes in the path):
 
 {
@@ -36,7 +39,7 @@ def main():
         data = json.load(sys.stdin)
     except Exception:
         return
-    event = data.get("hook_event_name", "")
+    event = sys.argv[1] if len(sys.argv) > 1 else data.get("hook_event_name", "")
     state = STATE_FOR_EVENT.get(event)
     if not state:
         return
