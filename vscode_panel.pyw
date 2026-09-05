@@ -537,8 +537,12 @@ class Panel(tk.Tk):
 
     def focus_window(self, hwnd, project):
         maximize(hwnd)
-        clear_status(project)           # you've looked at it; the row goes back to plain
-        self._states.pop(project, None)
+        # Opening a window only settles a state that has stopped changing.  "working"
+        # is still in progress, so it stays amber until the hook says otherwise -
+        # clearing it would blank the row while Claude is still going.
+        if read_statuses().get(project) != "working":
+            clear_status(project)       # you've looked at it; the row goes back to plain
+            self._states.pop(project, None)
         self.stop_flash()
         self.update_lights()
 

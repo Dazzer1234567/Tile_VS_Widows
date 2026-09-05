@@ -58,6 +58,7 @@ Details that matter:
 - Only changes *into* an alert state fire; `working` → `working` is silent, and re-reading the same `done` doesn't re-alert.
 - **Nothing blinks.** Every row colour is steady; the panel is meant to be read out of the corner of your eye, and movement there pulls focus rather than informing. The four states are amber (working), green (stopped, not yet looked at), red (waiting on you) and unfilled (nothing to report, or you have opened it since).
 - "Not yet looked at" needs no extra bookkeeping: the status file *is* that state. Clicking Max deletes it, which is what returns the row to unfilled.
+- Clicking Max only clears a state that has *settled*. `working` is still in progress, so opening that window leaves it amber — it stays amber until the hook reports the window finished. Only `done` and `waiting` are cleared by a click.
 - `rows` maps a project to a *list* of rows. Two windows can share a folder name, and the hook writes one status file per name, so both rows must show that one state.
 - `user32.LoadImageW.restype` / `LoadIconW.restype` are set explicitly — without that the returned `HICON` is truncated to 32 bits on 64-bit Python and the tray icon silently fails to register.
 
