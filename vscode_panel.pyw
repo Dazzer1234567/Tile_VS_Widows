@@ -2,10 +2,10 @@
 vscode_panel.py  -  small always-on-top control panel for your VS Code windows (Windows only, stdlib only)
 
 Buttons:
-    Hide all / Max all / Tile
-    Max: <project>   one per open VS Code window, maximises it and brings it to front,
-                     with a status light fed by claude_hook.py:
-                     grey idle / amber Claude working / green Claude finished / red Claude needs you
+    Tile / Max all / Hide all
+    Max: <project>   one per open VS Code window, maximises it and brings it to front.
+                     The whole row is tinted by claude_hook.py's status:
+                     plain idle / amber Claude working / green Claude finished / red Claude needs you
 
 When a window turns green (Claude finished) or red (Claude needs you) the panel notifies you:
 a system sound, a tray notification, a flashing taskbar button, and a blinking dot until you
@@ -37,12 +37,13 @@ WINDOW_CLASS = "Chrome_WidgetWin_1"
 MONITOR = 0                              # 0 = primary
 REFRESH_MS = 1000
 STATUS_DIR = os.path.join(tempfile.gettempdir(), "vscode_panel_status")   # written by claude_hook.py
-STATUS_COLORS = {"idle": "#b0b0b0", "working": "#e6a700", "done": "#2ecc40", "waiting": "#ff3b30"}
+# row background per state; "idle" means the panel's normal background
+STATUS_COLORS = {"idle": None, "working": "#f0b429", "done": "#3ad35a", "waiting": "#ff5a4d"}
 NOTIFY_ON = ("done", "waiting")          # states that raise an alert; set to () to stay silent
 NOTIFY_SOUND = True                      # play a system sound
 NOTIFY_TOAST = True                      # Windows tray notification ("Claude Code - <project>: finished")
 NOTIFY_FLASH_TASKBAR = True              # flash the panel's taskbar button until you look at the panel
-NOTIFY_BLINK_LIGHT = True                # blink that window's dot until you click its Max button
+NOTIFY_BLINK_ROW = True                  # flash that window's whole row until you click its Max button
 BLINK_MS = 450                           # blink half-period
 SCROLL_TO_BOTTOM = True                  # after tiling, wheel-scroll the chat panel in each window to the end
 SCROLL_POINTS = [(0.80, 0.50)]           # (x, y) as fraction of window size: where the chat panel lives
@@ -387,6 +388,17 @@ class Tray:
             self.added = False
 
 
+def logo_image(size=16, gap=2):
+    """The four-black-squares mark as a PhotoImage, drawn pixel-wise so it needs no file.
+    Unpainted pixels stay transparent, so the button's background shows through."""
+    img = tk.PhotoImage(width=size, height=size)
+    cell = (size - gap) // 2
+    for x in (0, cell + gap):
+        for y in (0, cell + gap):
+            img.put("#000000", to=(x, y, x + cell, y + cell))
+    return img
+
+
 # ---- UI --------------------------------------------------------------------
 class Panel(tk.Tk):
     def __init__(self):
@@ -413,9 +425,13 @@ class Panel(tk.Tk):
         top = tk.Frame(self)
         top.pack(fill="x")
         self.buttons = []
-        for text, fn in (("Hide all", hide_all), ("Max all", max_all), ("Tile", self.tile)):
-            b = tk.Button(top, text=text, width=9, command=fn)
-            b.pack(side="left", padx=2)
+        self.logo = logo_image()            # keep a reference or Tk garbage-collects it
+        for text, fn, img in (("Tile", self.tile, self.logo),
+                              ("Max all", max_all, None),
+                              ("Hide all", hide_all, None)):
+            b = tk.Button(top, text=text, image=img, compound="right", padx=6, command=fn)
+            # expand rather than a fixed width: with an image, width would mean pixels
+            b.pack(side="left", padx=2, fill="x", expand=True)
             self.buttons.append(b)
 
         self.progress = ttk.Progressbar(self, mode="determinate")
@@ -431,6 +447,7 @@ class Panel(tk.Tk):
         self._states = read_statuses()
         self._alerted = set()               # projects with an alert you have not acknowledged
         self._blink = False
+        self._bg = self.cget("bg")          # what an idle row looks like
         self._hwnd = self.panel_hwnd()
         self._tray = Tray(self._hwnd)
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -478,7 +495,8 @@ class Panel(tk.Tk):
             self._busy = False
 
     def _set_buttons(self, state):
-        for b in self.buttons + self.list.winfo_children():
+        rows = [b for f in self.list.winfo_children() for b in f.winfo_children()]
+        for b in self.buttons + rows:
             if isinstance(b, tk.Button):
                 b.configure(state=state)
 
@@ -497,7 +515,7 @@ class Panel(tk.Tk):
             self._sig = sig
             for w in self.list.winfo_children():
                 w.destroy()
-            self.rows = {}                      # project -> indicator label
+            self.rows = {}                      # project -> [(row frame, button), ...]
             seen = {}
             for h, t in wins:
                 proj = project_name(t)
@@ -507,12 +525,12 @@ class Panel(tk.Tk):
                     name = f"{name} ({seen[name]})"
                 row = tk.Frame(self.list)
                 row.pack(fill="x", pady=1)
-                light = tk.Label(row, text="\u25cf", font=("Segoe UI", 14),
-                                 fg=STATUS_COLORS["idle"], width=2)
-                light.pack(side="left")
-                tk.Button(row, text=f"Max: {name}", anchor="w",
-                          command=lambda h=h, p=proj: self.focus_window(h, p)).pack(side="left", fill="x", expand=True)
-                self.rows[proj] = light
+                btn = tk.Button(row, text=f"Max: {name}", anchor="w", relief="flat", bd=1,
+                                command=lambda h=h, p=proj: self.focus_window(h, p))
+                btn.pack(fill="x", padx=1, pady=1)
+                # a list: two windows can share a folder name, and the hook writes one
+                # status file per name, so both rows must show that same state
+                self.rows.setdefault(proj, []).append((row, btn))
             if not wins:
                 tk.Label(self.list, text="no VS Code windows").pack()
         self.update_lights()
@@ -520,7 +538,7 @@ class Panel(tk.Tk):
 
     def focus_window(self, hwnd, project):
         maximize(hwnd)
-        clear_status(project)           # you've looked at it; light goes back to idle
+        clear_status(project)           # you've looked at it; the row goes back to plain
         self._states.pop(project, None)
         self._alerted.discard(project)
         self.stop_flash()
@@ -533,11 +551,13 @@ class Panel(tk.Tk):
                 self.alert(proj, state)
         self._states = states
         self._alerted &= set(states)            # a cleared status cancels its alert
-        for proj, light in getattr(self, "rows", {}).items():
-            if NOTIFY_BLINK_LIGHT and self._blink and proj in self._alerted:
-                light.configure(fg=light.master.cget("bg"))
-            else:
-                light.configure(fg=STATUS_COLORS.get(states.get(proj, "idle"), STATUS_COLORS["idle"]))
+        for proj, widgets in getattr(self, "rows", {}).items():
+            colour = STATUS_COLORS.get(states.get(proj, "idle")) or self._bg
+            if NOTIFY_BLINK_ROW and self._blink and proj in self._alerted:
+                colour = self._bg                       # the off half of the flash
+            for row, btn in widgets:
+                row.configure(bg=colour)
+                btn.configure(bg=colour, activebackground=colour)
 
     def alert(self, project, state):
         """A window just changed to a state worth interrupting you for."""
@@ -555,7 +575,7 @@ class Panel(tk.Tk):
             flash_taskbar(self._hwnd, False)
 
     def _blink_tick(self):
-        """Toggle the dots of unacknowledged alerts on and off."""
+        """Flash the rows of unacknowledged alerts on and off."""
         if self._alerted or self._blink:
             self._blink = bool(self._alerted) and not self._blink
             self.update_lights()

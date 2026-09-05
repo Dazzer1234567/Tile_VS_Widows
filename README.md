@@ -10,7 +10,7 @@ Darius works with four (or more) separate VS Code windows open at once, each a d
 2. **Hide all** (minimise) and **Max all** (maximise every window without changing what's currently in front).
 3. Have one **"Max: <project>"** button per open window, named after the project folder, that maximises that window and brings it to front.
 4. After tiling, have the Claude Code chat panel in each window **scrolled to the bottom**, so the latest output is visible.
-5. See a **status light** per window showing whether Claude Code is working, has finished, or is waiting for input — so he can glance at the panel instead of checking each window.
+5. See at a glance, from the corner of his eye, whether Claude Code is working, has finished, or is waiting for input — so he can glance at the panel instead of checking each window.
 
 ## Files
 
@@ -40,7 +40,7 @@ There is no API to tell the Claude Code webview to scroll. Instead, after `SETTL
 | `Stop` | `done` | green |
 | `Notification` | `waiting` | red |
 
-The event name comes from `argv[1]` when the registration passes one, falling back to the payload's `hook_event_name`, so a payload without that field still writes a status file instead of silently doing nothing. It reads the hook JSON from stdin, takes `basename(cwd)` as the project, and writes `%TEMP%\vscode_panel_status\<project>.json`. The panel polls that directory every `REFRESH_MS` and colours the `●` next to the matching Max button. Clicking the Max button deletes the status file (light back to grey).
+The event name comes from `argv[1]` when the registration passes one, falling back to the payload's `hook_event_name`, so a payload without that field still writes a status file instead of silently doing nothing. It reads the hook JSON from stdin, takes `basename(cwd)` as the project, and writes `%TEMP%\vscode_panel_status\<project>.json`. The panel polls that directory every `REFRESH_MS` and tints the **whole row** of the matching Max button — the frame and the button itself, not a small indicator — so it is visible peripherally. Clicking the Max button deletes the status file (row back to plain).
 
 ### Notifications
 The light alone is passive — you still have to look at the panel. So `update_lights()` also watches for *transitions*: when a project's state changes into one of `NOTIFY_ON` (default `done` and `waiting`), `alert()` fires four ways, each independently switchable:
@@ -50,14 +50,16 @@ The light alone is passive — you still have to look at the panel. So `update_l
 | `NOTIFY_SOUND` | `winsound.MessageBeep` — asterisk for *finished*, exclamation for *needs you* |
 | `NOTIFY_TOAST` | A Windows notification via `Shell_NotifyIconW` (`NIM_MODIFY` + `NIF_INFO`), reading `Claude Code — <project>: finished` |
 | `NOTIFY_FLASH_TASKBAR` | `FlashWindowEx` with `FLASHW_TIMERNOFG`, so the panel's taskbar button flashes until you bring it to the foreground |
-| `NOTIFY_BLINK_LIGHT` | The dot blinks every `BLINK_MS` until you click that window's Max button |
+| `NOTIFY_BLINK_ROW` | The whole row flashes every `BLINK_MS` until you click that window's Max button |
 
 Details that matter:
 
 - The toast needs a tray icon to come from, so `Tray` registers one lazily on the first alert (using the same embedded `.ico`) and removes it on quit — closing via the window's X or right-clicking the drag bar both go through `close()`, so no ghost icon is left behind.
 - `_states` is seeded from disk in `__init__`, so a status file left over from a previous run doesn't fire an alert the moment the panel starts.
 - Only changes *into* an alert state fire; `working` → `working` is silent, and re-reading the same `done` doesn't re-alert.
-- Clicking Max deletes the status file, which clears the alert, stops the blink and stops the taskbar flash.
+- `working` tints the row steadily; only the alert states (`done`, `waiting`) flash, so a flashing row always means it wants you.
+- Clicking Max deletes the status file, which clears the alert, stops the flash and stops the taskbar flash.
+- `rows` maps a project to a *list* of rows. Two windows can share a folder name, and the hook writes one status file per name, so both rows must show that one state.
 - `user32.LoadImageW.restype` / `LoadIconW.restype` are set explicitly — without that the returned `HICON` is truncated to 32 bits on 64-bit Python and the tray icon silently fails to register.
 
 Hook config in `~/.claude/settings.json`. Use the exec form (`command` + `args`) rather than one
@@ -79,11 +81,13 @@ backslash-doubling, and each registration passes its own event name.
 Restart the VS Code windows after editing settings so the extension picks the hooks up.
 
 ### Misc
+- Top row order is **Tile / Max all / Hide all**, Tile first because it is the one used most. The buttons `pack` with `expand=True` rather than a fixed `width`: on a button carrying an image, Tk reads `width` as pixels rather than characters, so an explicit width would size the three inconsistently.
+- The Tile button carries the four-black-squares logo to the right of its label (`compound="right"`). `logo_image()` draws it into a `PhotoImage` with `put()` rather than loading a file, so the panel stays a single script; unpainted pixels stay transparent, letting the button background through.
 - Icon: a 2×2 black-squares `.ico` is embedded as base64 and written to `%TEMP%` on first run. `SetCurrentProcessExplicitAppUserModelID` is called so the taskbar shows it instead of the Python icon.
 - Drag bar: the `✋` row at the top moves the panel. `SHOW_TITLEBAR = False` makes it frameless (right-click the hand to quit).
 
 ## Config knobs (top of `vscode_panel.py`)
-`TITLE_SUFFIX`, `MONITOR`, `REFRESH_MS`, `SCROLL_TO_BOTTOM`, `SCROLL_POINTS`, `SCROLL_NOTCHES`, `SCROLL_STEP_MS`, `SETTLE_MS`, `SHOW_TITLEBAR`, `STATUS_COLORS`, `NOTIFY_ON`, `NOTIFY_SOUND`, `NOTIFY_TOAST`, `NOTIFY_FLASH_TASKBAR`, `NOTIFY_BLINK_LIGHT`, `BLINK_MS`.
+`TITLE_SUFFIX`, `MONITOR`, `REFRESH_MS`, `SCROLL_TO_BOTTOM`, `SCROLL_POINTS`, `SCROLL_NOTCHES`, `SCROLL_STEP_MS`, `SETTLE_MS`, `SHOW_TITLEBAR`, `STATUS_COLORS`, `NOTIFY_ON`, `NOTIFY_SOUND`, `NOTIFY_TOAST`, `NOTIFY_FLASH_TASKBAR`, `NOTIFY_BLINK_ROW`, `BLINK_MS`.
 
 ## Status / open issues
 
