@@ -40,7 +40,7 @@ There is no API to tell the Claude Code webview to scroll. Instead, after `SETTL
 | `Stop` | `done` | green |
 | `Notification` | `waiting` | red |
 
-It reads the hook JSON from stdin, takes `basename(cwd)` as the project, and writes `%TEMP%\vscode_panel_status\<project>.json`. The panel polls that directory every `REFRESH_MS` and colours the `●` next to the matching Max button. Clicking the Max button deletes the status file (light back to grey).
+The event name comes from `argv[1]` when the registration passes one, falling back to the payload's `hook_event_name`, so a payload without that field still writes a status file instead of silently doing nothing. It reads the hook JSON from stdin, takes `basename(cwd)` as the project, and writes `%TEMP%\vscode_panel_status\<project>.json`. The panel polls that directory every `REFRESH_MS` and colours the `●` next to the matching Max button. Clicking the Max button deletes the status file (light back to grey).
 
 ### Notifications
 The light alone is passive — you still have to look at the panel. So `update_lights()` also watches for *transitions*: when a project's state changes into one of `NOTIFY_ON` (default `done` and `waiting`), `alert()` fires four ways, each independently switchable:
@@ -60,16 +60,22 @@ Details that matter:
 - Clicking Max deletes the status file, which clears the alert, stops the blink and stops the taskbar flash.
 - `user32.LoadImageW.restype` / `LoadIconW.restype` are set explicitly — without that the returned `HICON` is truncated to 32 bits on 64-bit Python and the tray icon silently fails to register.
 
-Hook config (double the backslashes in JSON):
+Hook config in `~/.claude/settings.json`. Use the exec form (`command` + `args`) rather than one
+shell string: the arguments go straight to the process, so the Windows paths need no quoting or
+backslash-doubling, and each registration passes its own event name.
 ```json
 {
   "hooks": {
-    "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "python C:\\tools\\claude_hook.py" } ] } ],
-    "Stop":             [ { "hooks": [ { "type": "command", "command": "python C:\\tools\\claude_hook.py" } ] } ],
-    "Notification":     [ { "hooks": [ { "type": "command", "command": "python C:\\tools\\claude_hook.py" } ] } ]
+    "Stop": [ { "hooks": [ {
+      "type": "command",
+      "command": "C:/Python314/python.exe",
+      "args": ["C:/0_CODE/Tile_VS_Widows/claude_hook.py", "Stop"],
+      "timeout": 5
+    } ] } ]
   }
 }
 ```
+— and the same for `UserPromptSubmit` and `Notification`, each with its own event name.
 Restart the VS Code windows after editing settings so the extension picks the hooks up.
 
 ### Misc
