@@ -49,6 +49,13 @@ The speaker keeps its own blue/red background rather than taking the row's statu
 
 The muted set cannot live on the widgets, because `refresh()` destroys and rebuilds every row whenever a window opens or closes. It lives in `Panel.muted` and is written to `%APPDATA%\vscode_panel\prefs.json` on each click — deliberately *not* alongside the status files in `%TEMP%`, which are disposable, while a preference should outlive a reboot or a temp sweep. A failed read or write is swallowed: a preference is not worth crashing the panel over.
 
+### Spoken phrase per project
+To the right of each row is a text box. Whatever you type there is **spoken when that project turns green**; leave it empty and you get the plain rising tone instead. Red keeps its falling tone either way, so "finished" and "needs you" never sound alike.
+
+Speech is Windows SAPI (`System.Speech.Synthesis`) driven through PowerShell, so the panel still needs nothing outside the standard library. The cost is paid **once, when you commit the text** (Enter or clicking away), not when it speaks: `render_speech()` synthesises to a WAV in `%TEMP%` keyed by an MD5 of the phrase, on a background thread so the UI never blocks. Speaking is then just `PlaySound` on a cached file — no more expensive than the beep, and with no synthesis latency at the moment you want to hear it. Editing the text renders a new file; the old one stays cached harmlessly. `SPEAK_VOICE` and `SPEAK_RATE` pick the voice and speed.
+
+A related fix was needed to make the box usable at all: `refresh()` rebuilt every row whenever the window *signature* changed, and the signature was the full window titles — which churn constantly as you work, since the title carries the open filename. A rebuild mid-sentence would have destroyed the box you were typing in. The signature is now `(hwnd, project name)`, so rows are rebuilt only when a window actually opens or closes. Keystrokes are also mirrored into `Panel.say` as you type, so even a genuine rebuild restores what you had.
+
 ### Notifications
 The light alone is passive — you still have to look at the panel. So `update_lights()` also watches for *transitions*: when a project's state changes into one of `NOTIFY_ON` (default `done` and `waiting`), `alert()` fires four ways, each independently switchable:
 
@@ -95,6 +102,7 @@ Restart the VS Code windows after editing settings so the extension picks the ho
 - Top row order is **Tile / Max all / Hide all**, Tile first because it is the one used most. The buttons `pack` with `expand=True` rather than a fixed `width`: on a button carrying an image, Tk reads `width` as pixels rather than characters, so an explicit width would size the three inconsistently.
 - The Tile button carries the four-black-squares logo to the right of its label (`compound="right"`). `logo_image()` draws it into a `PhotoImage` with `put()` rather than loading a file, so the panel stays a single script; unpainted pixels stay transparent, letting the button background through.
 - Icon: a 2×2 black-squares `.ico` is embedded as base64 and written to `%TEMP%` on first run. `SetCurrentProcessExplicitAppUserModelID` is called so the taskbar shows it instead of the Python icon.
+- The spoken-text box is a plain `Entry` and deliberately keeps its normal background rather than the row's status tint, which would hurt readability of the text.
 - Drag bar: the `✋` row at the top moves the panel. It is padded to twice its natural height to be an easy target; the padding is derived from the label's `reqheight` rather than a pixel constant, so it still doubles at any DPI or font size. `SHOW_TITLEBAR = False` makes it frameless (right-click the hand to quit).
 
 ## Config knobs (top of `vscode_panel.py`)

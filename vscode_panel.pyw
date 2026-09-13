@@ -25,10 +25,13 @@ import base64
 import ctypes
 import json
 import ctypes.wintypes as wt
+import hashlib
 import math
 import os
 import re
+import subprocess
 import tempfile
+import threading
 import wave
 import tkinter as tk
 import winsound
@@ -53,6 +56,9 @@ SOUND_FONT = ("Segoe UI Emoji", 14)
 # (frequency Hz, milliseconds) per alert.  Rising = finished, falling = wants you.
 SOUND_TONES = {"done": [(660, 90), (880, 150)], "waiting": [(760, 90), (570, 170)]}
 SOUND_VOLUME = 0.35                      # 0-1, of full scale
+SPEAK_VOICE = ""                         # "" = Windows default; e.g. "Microsoft Zira Desktop"
+SPEAK_RATE = 0                           # SAPI rate, -10 (slow) to 10 (fast)
+SAY_WIDTH = 14                           # width of each row's spoken-text box, in characters
 # row background per state; "idle" means the panel's normal background
 STATUS_COLORS = {"idle": None, "working": "#f0b429", "done": "#3ad35a", "waiting": "#ff5a4d"}
 NOTIFY_ON = ("done", "waiting")          # states that raise an alert; set to () to stay silent
@@ -70,6 +76,7 @@ SHOW_TITLEBAR = True                     # False = frameless; drag with the hand
 SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE = 3, 6, 9
 GW_OWNER = 4
 MOUSEEVENTF_MOVE, MOUSEEVENTF_WHEEL = 0x0001, 0x0800
+CREATE_NO_WINDOW = 0x08000000            # keep PowerShell from flashing a console
 FLASHW_STOP, FLASHW_ALL, FLASHW_TIMERNOFG = 0x0, 0x3, 0xC
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_ICON, NIF_TIP, NIF_INFO = 0x02, 0x04, 0x10
@@ -340,20 +347,21 @@ def read_statuses():
     return out
 
 
-def read_muted():
-    """Projects whose green/red sound you have switched off."""
+def read_prefs():
+    """(projects you have muted, {project: phrase to speak when it finishes})"""
     try:
         with open(PREFS_PATH) as f:
-            return set(json.load(f).get("muted", []))
+            d = json.load(f)
+        return set(d.get("muted", [])), dict(d.get("say", {}))
     except Exception:
-        return set()
+        return set(), {}
 
 
-def write_muted(muted):
+def write_prefs(muted, say):
     try:
         os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
         with open(PREFS_PATH, "w") as f:
-            json.dump({"muted": sorted(muted)}, f)
+            json.dump({"muted": sorted(muted), "say": say}, f)
     except Exception:
         pass                        # a preference is not worth crashing the panel over
 
@@ -395,6 +403,53 @@ def alert_wav(state):
     if not os.path.exists(path):
         write_tone(path, SOUND_TONES.get(state, SOUND_TONES["done"]))
     return path
+
+
+def ps_quote(text):
+    """Quote for a PowerShell single-quoted string: only ' needs escaping."""
+    return "'" + str(text).replace("'", "''") + "'"
+
+
+def say_wav(text):
+    """Where the rendering of this phrase lives.  Keyed by content, so editing the
+    text renders a new file and leaves the old one harmlessly cached."""
+    digest = hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+    return os.path.join(tempfile.gettempdir(), "vscode_panel_say_%s.wav" % digest)
+
+
+def render_speech(text):
+    """Synthesise `text` to a cached WAV with SAPI, via PowerShell so the panel keeps
+    to the standard library.  Done once when you edit the text - never at alert time,
+    where it would add a second of latency - so speaking then costs no more than a beep."""
+    path = say_wav(text)
+    if os.path.exists(path):
+        return path
+    script = ("Add-Type -AssemblyName System.Speech;"
+              "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
+              + ("$s.SelectVoice(%s);" % ps_quote(SPEAK_VOICE) if SPEAK_VOICE else "")
+              + "$s.Rate = %d;" % SPEAK_RATE
+              + "$s.SetOutputToWaveFile(%s);" % ps_quote(path)
+              + "$s.Speak(%s);" % ps_quote(text)
+              + "$s.Dispose()")
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                       creationflags=CREATE_NO_WINDOW, timeout=30,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        return None
+    return path if os.path.exists(path) else None
+
+
+def speak(text):
+    """Play the cached rendering of `text`.  Falls back to the beep if it is missing."""
+    path = say_wav(text)
+    if not os.path.exists(path):
+        return False
+    try:
+        winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+        return True
+    except Exception:
+        return False
 
 
 def play_alert(state):
@@ -511,7 +566,7 @@ class Panel(tk.Tk):
         # over from a previous run does not fire the moment the panel starts
         self._states = read_statuses()
         self._bg = self.cget("bg")          # what an idle row looks like
-        self.muted = read_muted()           # projects you've switched the sound off for
+        self.muted, self.say = read_prefs()  # muted projects, and what to speak for each
         self._hwnd = self.panel_hwnd()
         self._tray = Tray(self._hwnd)
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -573,7 +628,7 @@ class Panel(tk.Tk):
     # -- per-window buttons
     def refresh(self):
         wins = vscode_windows()
-        sig = tuple(wins)
+        sig = tuple((h, project_name(t)) for h, t in wins)
         if sig != self._sig and not self._busy:
             self._sig = sig
             for w in self.list.winfo_children():
@@ -591,12 +646,18 @@ class Panel(tk.Tk):
                 mute = tk.Button(row, font=SOUND_FONT, width=2, relief="flat", bd=1,
                                  command=lambda p=proj: self.toggle_sound(p))
                 mute.pack(side="left", padx=(1, 0), pady=1)
+                say = tk.Entry(row, width=SAY_WIDTH)
+                say.insert(0, self.say.get(proj, ""))
+                say.pack(side="right", padx=(2, 1), pady=1)
+                say.bind("<KeyRelease>", lambda e, p=proj, w=say: self.say_typed(p, w))
+                say.bind("<Return>",     lambda e, p=proj, w=say: self.say_commit(p, w))
+                say.bind("<FocusOut>",   lambda e, p=proj, w=say: self.say_commit(p, w))
                 btn = tk.Button(row, text=f"Max: {name}", anchor="w", relief="flat", bd=1,
                                 command=lambda h=h, p=proj: self.focus_window(h, p))
                 btn.pack(side="left", fill="x", expand=True, padx=1, pady=1)
                 # a list: two windows can share a folder name, and the hook writes one
                 # status file per name, so both rows must show that same state
-                self.rows.setdefault(proj, []).append((row, btn, mute))
+                self.rows.setdefault(proj, []).append((row, btn, mute, say))
             if not wins:
                 tk.Label(self.list, text="no VS Code windows").pack()
         self.update_lights()
@@ -624,21 +685,40 @@ class Panel(tk.Tk):
             muted = proj in self.muted
             icon = SOUND_OFF if muted else SOUND_ON
             sound_bg = SOUND_OFF_BG if muted else SOUND_ON_BG
-            for row, btn, mute in widgets:
+            for row, btn, mute, _say in widgets:
                 row.configure(bg=colour)
                 btn.configure(bg=colour, activebackground=colour)
                 mute.configure(text=icon, bg=sound_bg, activebackground=sound_bg)
 
+    def say_typed(self, project, entry):
+        """Keep the in-memory copy current on every keystroke, so a row rebuild
+        mid-sentence restores what you had typed.  Disk and synthesis wait for commit."""
+        self.say[project] = entry.get()
+
+    def say_commit(self, project, entry):
+        """Persist the phrase and render it, once, off the UI thread."""
+        text = entry.get().strip()
+        if text:
+            self.say[project] = text
+        else:
+            self.say.pop(project, None)
+        write_prefs(self.muted, self.say)
+        if text and not os.path.exists(say_wav(text)):
+            threading.Thread(target=render_speech, args=(text,), daemon=True).start()
+
     def toggle_sound(self, project):
         """Switch this project's green/red sound on or off, and remember it."""
         self.muted.symmetric_difference_update({project})
-        write_muted(self.muted)
+        write_prefs(self.muted, self.say)
         self.update_lights()
 
     def alert(self, project, state):
         """A window just changed to a state worth interrupting you for."""
         if NOTIFY_SOUND and project not in self.muted:
-            play_alert(state)
+            text = self.say.get(project, "").strip()
+            # the phrase is for "it has stopped"; red keeps its own falling tone
+            if not (state == "done" and text and speak(text)):
+                play_alert(state)
         if NOTIFY_TOAST:
             self._tray.notify("Claude Code",
                               "%s: %s" % (project, "finished" if state == "done" else "needs you"))
