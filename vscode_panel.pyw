@@ -46,6 +46,8 @@ STATUS_DIR = os.path.join(tempfile.gettempdir(), "vscode_panel_status")   # writ
 PREFS_PATH = os.path.join(os.environ.get("APPDATA") or tempfile.gettempdir(),
                           "vscode_panel", "prefs.json")
 SOUND_ON, SOUND_OFF = "🔊", "🔇"     # speaker / muted speaker
+SOUND_ON_BG, SOUND_OFF_BG = "#1f6feb", "#e5484d"      # blue when sounding, red when muted
+SOUND_FONT = ("Segoe UI Emoji", 14)
 # row background per state; "idle" means the panel's normal background
 STATUS_COLORS = {"idle": None, "working": "#f0b429", "done": "#3ad35a", "waiting": "#ff5a4d"}
 NOTIFY_ON = ("done", "waiting")          # states that raise an alert; set to () to stay silent
@@ -552,7 +554,7 @@ class Panel(tk.Tk):
                     name = f"{name} ({seen[name]})"
                 row = tk.Frame(self.list)
                 row.pack(fill="x", pady=1)
-                mute = tk.Button(row, font=("Segoe UI Emoji", 9), width=2, relief="flat", bd=1,
+                mute = tk.Button(row, font=SOUND_FONT, width=2, relief="flat", bd=1,
                                  command=lambda p=proj: self.toggle_sound(p))
                 mute.pack(side="left", padx=(1, 0), pady=1)
                 btn = tk.Button(row, text=f"Max: {name}", anchor="w", relief="flat", bd=1,
@@ -585,11 +587,13 @@ class Panel(tk.Tk):
         self._states = states
         for proj, widgets in getattr(self, "rows", {}).items():
             colour = STATUS_COLORS.get(states.get(proj, "idle")) or self._bg
-            icon = SOUND_OFF if proj in self.muted else SOUND_ON
+            muted = proj in self.muted
+            icon = SOUND_OFF if muted else SOUND_ON
+            sound_bg = SOUND_OFF_BG if muted else SOUND_ON_BG
             for row, btn, mute in widgets:
                 row.configure(bg=colour)
                 btn.configure(bg=colour, activebackground=colour)
-                mute.configure(text=icon, bg=colour, activebackground=colour)
+                mute.configure(text=icon, bg=sound_bg, activebackground=sound_bg)
 
     def toggle_sound(self, project):
         """Switch this project's green/red sound on or off, and remember it."""

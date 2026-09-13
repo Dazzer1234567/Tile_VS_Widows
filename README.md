@@ -43,7 +43,9 @@ There is no API to tell the Claude Code webview to scroll. Instead, after `SETTL
 The event name comes from `argv[1]` when the registration passes one, falling back to the payload's `hook_event_name`, so a payload without that field still writes a status file instead of silently doing nothing. It reads the hook JSON from stdin, takes `basename(cwd)` as the project, and writes `%TEMP%\vscode_panel_status\<project>.json`. The panel polls that directory every `REFRESH_MS` and tints the **whole row** of the matching Max button — the frame and the button itself, not a small indicator — so it is visible peripherally. Clicking the Max button deletes the status file (row back to plain).
 
 ### Per-project sound toggle
-Each row carries a small speaker button, 🔊 on / 🔇 muted, that switches the sound off for that project alone — useful when one window is chatty and the others are not. It mutes only the sound; the row still turns green or red.
+Each row carries a speaker button — **blue 🔊 when the sound is on, red 🔇 when muted** — that switches the sound off for that project alone, useful when one window is chatty and the others are not. It mutes only the sound; the row still turns green or red.
+
+The speaker keeps its own blue/red background rather than taking the row's status tint, so on/off stays readable whatever the row is doing. Its colour has to be set on the *background*: `Segoe UI Emoji` is a colour font, so `fg` would not repaint the glyph. Size comes from `SOUND_FONT`; at 14pt it makes the row 65px tall against 44px with the original 9pt.
 
 The muted set cannot live on the widgets, because `refresh()` destroys and rebuilds every row whenever a window opens or closes. It lives in `Panel.muted` and is written to `%APPDATA%\vscode_panel\prefs.json` on each click — deliberately *not* alongside the status files in `%TEMP%`, which are disposable, while a preference should outlive a reboot or a temp sweep. A failed read or write is swallowed: a preference is not worth crashing the panel over.
 
