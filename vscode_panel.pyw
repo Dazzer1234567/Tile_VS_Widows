@@ -58,7 +58,8 @@ SOUND_TONES = {"done": [(660, 90), (880, 150)], "waiting": [(760, 90), (570, 170
 SOUND_VOLUME = 0.35                      # 0-1, of full scale
 SPEAK_VOICE = ""                         # "" = Windows default; e.g. "Microsoft Zira Desktop"
 SPEAK_RATE = 0                           # SAPI rate, -10 (slow) to 10 (fast)
-SAY_WIDTH = 14                           # width of each row's spoken-text box, in characters
+SAY_WIDTH = 14                           # minimum width of the spoken-text box, in characters
+SAY_SAVE_MS = 800                        # idle time after typing before the phrase is saved
 # row background per state; "idle" means the panel's normal background
 STATUS_COLORS = {"idle": None, "working": "#f0b429", "done": "#3ad35a", "waiting": "#ff5a4d"}
 NOTIFY_ON = ("done", "waiting")          # states that raise an alert; set to () to stay silent
@@ -567,6 +568,7 @@ class Panel(tk.Tk):
         self._states = read_statuses()
         self._bg = self.cget("bg")          # what an idle row looks like
         self.muted, self.say = read_prefs()  # muted projects, and what to speak for each
+        self._say_job = None                # pending debounced save of a phrase
         self._hwnd = self.panel_hwnd()
         self._tray = Tray(self._hwnd)
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -582,6 +584,7 @@ class Panel(tk.Tk):
             return user32.GetParent(self.winfo_id()) or self.winfo_id()
 
     def close(self):
+        write_prefs(self.muted, self.say)       # flush a phrase still inside the debounce
         self._tray.remove()
         self.destroy()
 
@@ -613,10 +616,13 @@ class Panel(tk.Tk):
             self._busy = False
 
     def _set_buttons(self, state):
-        rows = [b for f in self.list.winfo_children() for b in f.winfo_children()]
-        for b in self.buttons + rows:
-            if isinstance(b, tk.Button):
-                b.configure(state=state)
+        def buttons(w):                     # the row buttons sit inside a head frame now
+            for c in w.winfo_children():
+                if isinstance(c, tk.Button):
+                    yield c
+                yield from buttons(c)
+        for b in self.buttons + list(buttons(self.list)):
+            b.configure(state=state)
 
     # -- drag bar
     def _drag_start(self, e):
@@ -643,21 +649,23 @@ class Panel(tk.Tk):
                     name = f"{name} ({seen[name]})"
                 row = tk.Frame(self.list)
                 row.pack(fill="x", pady=1)
-                mute = tk.Button(row, font=SOUND_FONT, width=2, relief="flat", bd=1,
+                head = tk.Frame(row)            # speaker + Max button
+                head.pack(fill="x")
+                mute = tk.Button(head, font=SOUND_FONT, width=2, relief="flat", bd=1,
                                  command=lambda p=proj: self.toggle_sound(p))
                 mute.pack(side="left", padx=(1, 0), pady=1)
-                say = tk.Entry(row, width=SAY_WIDTH)
-                say.insert(0, self.say.get(proj, ""))
-                say.pack(side="right", padx=(2, 1), pady=1)
-                say.bind("<KeyRelease>", lambda e, p=proj, w=say: self.say_typed(p, w))
-                say.bind("<Return>",     lambda e, p=proj, w=say: self.say_commit(p, w))
-                say.bind("<FocusOut>",   lambda e, p=proj, w=say: self.say_commit(p, w))
-                btn = tk.Button(row, text=f"Max: {name}", anchor="w", relief="flat", bd=1,
+                btn = tk.Button(head, text=f"Max: {name}", anchor="w", relief="flat", bd=1,
                                 command=lambda h=h, p=proj: self.focus_window(h, p))
                 btn.pack(side="left", fill="x", expand=True, padx=1, pady=1)
+                say = tk.Entry(row, width=SAY_WIDTH)    # the phrase, underneath
+                say.insert(0, self.say.get(proj, ""))
+                say.pack(fill="x", padx=1, pady=(0, 2))
+                say.bind("<KeyRelease>", lambda e, p=proj, w=say: self.say_typed(p, w))
+                say.bind("<Return>",     lambda e, p=proj, w=say: self.say_done(p, w, leave=True))
+                say.bind("<FocusOut>",   lambda e, p=proj, w=say: self.say_done(p, w))
                 # a list: two windows can share a folder name, and the hook writes one
                 # status file per name, so both rows must show that same state
-                self.rows.setdefault(proj, []).append((row, btn, mute, say))
+                self.rows.setdefault(proj, []).append((row, head, btn, mute, say))
             if not wins:
                 tk.Label(self.list, text="no VS Code windows").pack()
         self.update_lights()
@@ -685,19 +693,36 @@ class Panel(tk.Tk):
             muted = proj in self.muted
             icon = SOUND_OFF if muted else SOUND_ON
             sound_bg = SOUND_OFF_BG if muted else SOUND_ON_BG
-            for row, btn, mute, _say in widgets:
+            for row, head, btn, mute, _say in widgets:
                 row.configure(bg=colour)
+                head.configure(bg=colour)
                 btn.configure(bg=colour, activebackground=colour)
                 mute.configure(text=icon, bg=sound_bg, activebackground=sound_bg)
 
     def say_typed(self, project, entry):
-        """Keep the in-memory copy current on every keystroke, so a row rebuild
-        mid-sentence restores what you had typed.  Disk and synthesis wait for commit."""
+        """Mirror each keystroke into memory - so a row rebuild mid-sentence restores
+        what you had - and queue a save.  Debounced rather than tied to Enter or
+        focus-out: typing a phrase and then shutting down used to lose it."""
         self.say[project] = entry.get()
+        if self._say_job:
+            self.after_cancel(self._say_job)
+        self._say_job = self.after(SAY_SAVE_MS, lambda p=project: self.say_store(p))
 
-    def say_commit(self, project, entry):
+    def say_done(self, project, entry, leave=False):
+        """Enter or clicking away: save now rather than waiting out the debounce."""
+        self.say[project] = entry.get()
+        self.say_store(project)
+        if leave:
+            entry.selection_clear()
+            self.focus_set()            # Enter drops you out of the box
+            return "break"
+
+    def say_store(self, project):
         """Persist the phrase and render it, once, off the UI thread."""
-        text = entry.get().strip()
+        if self._say_job:
+            self.after_cancel(self._say_job)
+            self._say_job = None
+        text = self.say.get(project, "").strip()
         if text:
             self.say[project] = text
         else:
