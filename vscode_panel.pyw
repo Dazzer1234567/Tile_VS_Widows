@@ -41,10 +41,15 @@ WINDOW_CLASS = "Chrome_WidgetWin_1"
 MONITOR = 0                              # 0 = primary
 REFRESH_MS = 1000
 STATUS_DIR = os.path.join(tempfile.gettempdir(), "vscode_panel_status")   # written by claude_hook.py
+# per-project preferences.  Not in %TEMP% with the status files: those are disposable,
+# these are meant to outlive a reboot or a temp sweep.
+PREFS_PATH = os.path.join(os.environ.get("APPDATA") or tempfile.gettempdir(),
+                          "vscode_panel", "prefs.json")
+SOUND_ON, SOUND_OFF = "🔊", "🔇"     # speaker / muted speaker
 # row background per state; "idle" means the panel's normal background
 STATUS_COLORS = {"idle": None, "working": "#f0b429", "done": "#3ad35a", "waiting": "#ff5a4d"}
 NOTIFY_ON = ("done", "waiting")          # states that raise an alert; set to () to stay silent
-NOTIFY_SOUND = True                      # play a system sound
+NOTIFY_SOUND = True                      # master switch; each row also has its own speaker toggle
 NOTIFY_TOAST = False                     # Windows tray notification popup; off - the row and the sound are enough
 NOTIFY_FLASH_TASKBAR = False             # flash the panel's taskbar button; off - nothing here should blink
 SCROLL_TO_BOTTOM = True                  # after tiling, wheel-scroll the chat panel in each window to the end
@@ -328,6 +333,24 @@ def read_statuses():
     return out
 
 
+def read_muted():
+    """Projects whose green/red sound you have switched off."""
+    try:
+        with open(PREFS_PATH) as f:
+            return set(json.load(f).get("muted", []))
+    except Exception:
+        return set()
+
+
+def write_muted(muted):
+    try:
+        os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
+        with open(PREFS_PATH, "w") as f:
+            json.dump({"muted": sorted(muted)}, f)
+    except Exception:
+        pass                        # a preference is not worth crashing the panel over
+
+
 def clear_status(project):
     safe = re.sub(r"[^\w.-]", "_", project)
     try:
@@ -452,6 +475,7 @@ class Panel(tk.Tk):
         # over from a previous run does not fire the moment the panel starts
         self._states = read_statuses()
         self._bg = self.cget("bg")          # what an idle row looks like
+        self.muted = read_muted()           # projects you've switched the sound off for
         self._hwnd = self.panel_hwnd()
         self._tray = Tray(self._hwnd)
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -528,12 +552,15 @@ class Panel(tk.Tk):
                     name = f"{name} ({seen[name]})"
                 row = tk.Frame(self.list)
                 row.pack(fill="x", pady=1)
+                mute = tk.Button(row, font=("Segoe UI Emoji", 9), width=2, relief="flat", bd=1,
+                                 command=lambda p=proj: self.toggle_sound(p))
+                mute.pack(side="left", padx=(1, 0), pady=1)
                 btn = tk.Button(row, text=f"Max: {name}", anchor="w", relief="flat", bd=1,
                                 command=lambda h=h, p=proj: self.focus_window(h, p))
-                btn.pack(fill="x", padx=1, pady=1)
+                btn.pack(side="left", fill="x", expand=True, padx=1, pady=1)
                 # a list: two windows can share a folder name, and the hook writes one
                 # status file per name, so both rows must show that same state
-                self.rows.setdefault(proj, []).append((row, btn))
+                self.rows.setdefault(proj, []).append((row, btn, mute))
             if not wins:
                 tk.Label(self.list, text="no VS Code windows").pack()
         self.update_lights()
@@ -558,13 +585,21 @@ class Panel(tk.Tk):
         self._states = states
         for proj, widgets in getattr(self, "rows", {}).items():
             colour = STATUS_COLORS.get(states.get(proj, "idle")) or self._bg
-            for row, btn in widgets:
+            icon = SOUND_OFF if proj in self.muted else SOUND_ON
+            for row, btn, mute in widgets:
                 row.configure(bg=colour)
                 btn.configure(bg=colour, activebackground=colour)
+                mute.configure(text=icon, bg=colour, activebackground=colour)
+
+    def toggle_sound(self, project):
+        """Switch this project's green/red sound on or off, and remember it."""
+        self.muted.symmetric_difference_update({project})
+        write_muted(self.muted)
+        self.update_lights()
 
     def alert(self, project, state):
         """A window just changed to a state worth interrupting you for."""
-        if NOTIFY_SOUND:
+        if NOTIFY_SOUND and project not in self.muted:
             play_alert(state)
         if NOTIFY_TOAST:
             self._tray.notify("Claude Code",

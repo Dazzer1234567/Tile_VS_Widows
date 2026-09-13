@@ -42,12 +42,17 @@ There is no API to tell the Claude Code webview to scroll. Instead, after `SETTL
 
 The event name comes from `argv[1]` when the registration passes one, falling back to the payload's `hook_event_name`, so a payload without that field still writes a status file instead of silently doing nothing. It reads the hook JSON from stdin, takes `basename(cwd)` as the project, and writes `%TEMP%\vscode_panel_status\<project>.json`. The panel polls that directory every `REFRESH_MS` and tints the **whole row** of the matching Max button — the frame and the button itself, not a small indicator — so it is visible peripherally. Clicking the Max button deletes the status file (row back to plain).
 
+### Per-project sound toggle
+Each row carries a small speaker button, 🔊 on / 🔇 muted, that switches the sound off for that project alone — useful when one window is chatty and the others are not. It mutes only the sound; the row still turns green or red.
+
+The muted set cannot live on the widgets, because `refresh()` destroys and rebuilds every row whenever a window opens or closes. It lives in `Panel.muted` and is written to `%APPDATA%\vscode_panel\prefs.json` on each click — deliberately *not* alongside the status files in `%TEMP%`, which are disposable, while a preference should outlive a reboot or a temp sweep. A failed read or write is swallowed: a preference is not worth crashing the panel over.
+
 ### Notifications
 The light alone is passive — you still have to look at the panel. So `update_lights()` also watches for *transitions*: when a project's state changes into one of `NOTIFY_ON` (default `done` and `waiting`), `alert()` fires four ways, each independently switchable:
 
 | Knob | What it does |
 |---|---|
-| `NOTIFY_SOUND` | `winsound.MessageBeep` — asterisk for *finished*, exclamation for *needs you* |
+| `NOTIFY_SOUND` | `winsound.MessageBeep` — asterisk for *finished*, exclamation for *needs you*. A master switch: each row also has its own speaker toggle (below). |
 | `NOTIFY_TOAST` | A Windows notification via `Shell_NotifyIconW` (`NIM_MODIFY` + `NIF_INFO`), reading `Claude Code — <project>: finished`. **Off by default** — the popup in the corner is intrusive, and the tinted row already says the same thing. No tray icon is registered while it is off. |
 | `NOTIFY_FLASH_TASKBAR` | `FlashWindowEx` with `FLASHW_TIMERNOFG`, so the panel's taskbar button flashes until you bring it to the foreground. **Off by default** — nothing about the panel should blink. |
 
