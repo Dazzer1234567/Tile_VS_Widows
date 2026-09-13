@@ -20,6 +20,7 @@ with a progress bar while it does so.  The button list refreshes every 2 s as wi
 Run with pythonw.exe (or rename to .pyw) to avoid a console window.
 """
 
+import array
 import base64
 import ctypes
 import json
@@ -28,6 +29,7 @@ import math
 import os
 import re
 import tempfile
+import wave
 import tkinter as tk
 import winsound
 from tkinter import ttk
@@ -48,6 +50,9 @@ PREFS_PATH = os.path.join(os.environ.get("APPDATA") or tempfile.gettempdir(),
 SOUND_ON, SOUND_OFF = "🔊", "🔇"     # speaker / muted speaker
 SOUND_ON_BG, SOUND_OFF_BG = "#1f6feb", "#e5484d"      # blue when sounding, red when muted
 SOUND_FONT = ("Segoe UI Emoji", 14)
+# (frequency Hz, milliseconds) per alert.  Rising = finished, falling = wants you.
+SOUND_TONES = {"done": [(660, 90), (880, 150)], "waiting": [(760, 90), (570, 170)]}
+SOUND_VOLUME = 0.35                      # 0-1, of full scale
 # row background per state; "idle" means the panel's normal background
 STATUS_COLORS = {"idle": None, "working": "#f0b429", "done": "#3ad35a", "waiting": "#ff5a4d"}
 NOTIFY_ON = ("done", "waiting")          # states that raise an alert; set to () to stay silent
@@ -369,9 +374,38 @@ def flash_taskbar(hwnd, on=True):
     user32.FlashWindowEx(ctypes.byref(fw))
 
 
+def write_tone(path, tones, rate=44100):
+    """A small WAV of (freq, ms) tones, each under a raised-cosine envelope so the
+    edges do not click.  Generated rather than shipped, like the icon."""
+    frames = array.array("h")
+    for freq, ms in tones:
+        n = int(rate * ms / 1000)
+        for i in range(n):
+            env = 0.5 - 0.5 * math.cos(2 * math.pi * min(i, n - i) / n)
+            frames.append(int(32767 * SOUND_VOLUME * env * math.sin(2 * math.pi * freq * i / rate)))
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(frames.tobytes())
+
+
+def alert_wav(state):
+    path = os.path.join(tempfile.gettempdir(), "vscode_panel_%s.wav" % state)
+    if not os.path.exists(path):
+        write_tone(path, SOUND_TONES.get(state, SOUND_TONES["done"]))
+    return path
+
+
 def play_alert(state):
-    winsound.MessageBeep(winsound.MB_ICONASTERISK if state == "done"
-                         else winsound.MB_ICONEXCLAMATION)
+    """Play our own WAV rather than MessageBeep.  MessageBeep plays whatever the
+    Windows sound scheme maps to SystemAsterisk / SystemExclamation, so on a machine
+    set to "No Sounds" - normal on an audio workstation - it is silent."""
+    try:
+        winsound.PlaySound(alert_wav(state),
+                           winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+    except Exception:
+        winsound.MessageBeep()
 
 
 class Tray:

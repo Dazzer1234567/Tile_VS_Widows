@@ -54,11 +54,15 @@ The light alone is passive — you still have to look at the panel. So `update_l
 
 | Knob | What it does |
 |---|---|
-| `NOTIFY_SOUND` | `winsound.MessageBeep` — asterisk for *finished*, exclamation for *needs you*. A master switch: each row also has its own speaker toggle (below). |
+| `NOTIFY_SOUND` | A short generated two-tone WAV — rising for *finished*, falling for *needs you*. A master switch: each row also has its own speaker toggle (above). |
 | `NOTIFY_TOAST` | A Windows notification via `Shell_NotifyIconW` (`NIM_MODIFY` + `NIF_INFO`), reading `Claude Code — <project>: finished`. **Off by default** — the popup in the corner is intrusive, and the tinted row already says the same thing. No tray icon is registered while it is off. |
 | `NOTIFY_FLASH_TASKBAR` | `FlashWindowEx` with `FLASHW_TIMERNOFG`, so the panel's taskbar button flashes until you bring it to the foreground. **Off by default** — nothing about the panel should blink. |
 
 Details that matter:
+
+- The sound is **not** `MessageBeep`. `MessageBeep` plays whatever the Windows sound scheme maps to `SystemAsterisk` / `SystemExclamation`, and on a machine whose scheme is set to *No Sounds* — normal on an audio workstation — it returns silently having played nothing. `write_tone()` generates a small WAV into `%TEMP%` on first use (like the icon) and `PlaySound(SND_FILENAME)` plays it, which ignores the scheme entirely. Tones and level are `SOUND_TONES` and `SOUND_VOLUME`.
+- Each tone sits under a raised-cosine envelope so it starts and ends at exactly zero and does not click.
+- It plays through the Windows **default playback device**, so on a machine with several interfaces the sound may be going somewhere you are not monitoring.
 
 - The toast needs a tray icon to come from, so `Tray` registers one lazily on the first alert (using the same embedded `.ico`) and removes it on quit — closing via the window's X or right-clicking the drag bar both go through `close()`, so no ghost icon is left behind.
 - `_states` is seeded from disk in `__init__`, so a status file left over from a previous run doesn't fire an alert the moment the panel starts.
