@@ -65,6 +65,18 @@ Pressing **Enter** saves the phrase and drops focus out of the box (the binding 
 
 A related fix was needed to make the box usable at all: `refresh()` rebuilt every row whenever the window *signature* changed, and the signature was the full window titles — which churn constantly as you work, since the title carries the open filename. A rebuild mid-sentence would have destroyed the box you were typing in. The signature is now `(hwnd, project name)`, so rows are rebuilt only when a window actually opens or closes. Keystrokes are also mirrored into `Panel.say` as you type, so even a genuine rebuild restores what you had.
 
+### Restart an app when a project finishes
+Under the spoken-phrase box is a second box: put the **full path to an executable** in it and, when that project turns green, every instance of it is closed and one is started again. Useful for a test build you want relaunched on each pass. The box turns pink while the path does not point at a file, so a typo says so instead of silently doing nothing. Quotes are stripped, so Explorer's *Copy as path* can be pasted straight in.
+
+Instances are matched on the **full image path**, never on the file name. That distinction is the whole safety story: matching `python.exe` or `node.exe` by name would kill unrelated processes across the machine, whereas a full-path match cannot touch another copy of the same-named exe living elsewhere. The panel's own process is skipped too.
+
+Closing is `WM_CLOSE` to each visible window first, so the app can shut down tidily, then `TerminateProcess` after `RESTART_GRACE_MS` for anything that ignored it. **It is a force-kill in the end — do not point this at something holding unsaved work.** All of it runs on a worker thread, since it sleeps out the grace period.
+
+Two limits worth knowing:
+
+- **Path only, no arguments.** The whole string is taken as the executable.
+- **Windows execution aliases** (Store apps, winget stubs) run from a different image path than the one you launch: the `notepad.exe` in System32 actually runs from `WindowsApps`. A strict comparison cannot match those, so the first restart of such an app closes nothing. `launch_app()` records what the alias really resolved to, so every restart after that works. Ordinary installed applications and build outputs are unaffected — their launch path *is* their image path.
+
 ### Notifications
 The light alone is passive — you still have to look at the panel. So `update_lights()` also watches for *transitions*: when a project's state changes into one of `NOTIFY_ON` (default `done` and `waiting`), `alert()` fires four ways, each independently switchable:
 
@@ -112,6 +124,7 @@ Restart the VS Code windows after editing settings so the extension picks the ho
 - The Tile button carries the four-black-squares logo to the right of its label (`compound="right"`). `logo_image()` draws it into a `PhotoImage` with `put()` rather than loading a file, so the panel stays a single script; unpainted pixels stay transparent, letting the button background through.
 - Icon: a 2×2 black-squares `.ico` is embedded as base64 and written to `%TEMP%` on first run. `SetCurrentProcessExplicitAppUserModelID` is called so the taskbar shows it instead of the Python icon.
 - The spoken-text box is a plain `Entry` and deliberately keeps its normal background rather than the row's status tint, which would hurt readability of the text.
+- Both text boxes share one implementation (`_bind_field` / `field_typed` / `field_done` / `field_store`), keyed by which dict they write to, so the debounced-save behaviour cannot drift between them.
 - Drag bar: the `✋` row at the top moves the panel. It is padded to twice its natural height to be an easy target; the padding is derived from the label's `reqheight` rather than a pixel constant, so it still doubles at any DPI or font size. `SHOW_TITLEBAR = False` makes it frameless (right-click the hand to quit).
 
 ## Config knobs (top of `vscode_panel.py`)

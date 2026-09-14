@@ -32,6 +32,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 import wave
 import tkinter as tk
 import winsound
@@ -61,6 +62,8 @@ VOLUME_SAVE_MS = 500                     # idle after dragging before saving and
 SPEAK_VOICE = ""                         # "" = Windows default; e.g. "Microsoft Zira Desktop"
 SPEAK_RATE = 0                           # SAPI rate, -10 (slow) to 10 (fast)
 SAY_WIDTH = 14                           # minimum width of the spoken-text box, in characters
+RESTART_GRACE_MS = 1500                  # how long an app gets to close itself before being killed
+BAD_PATH_BG = "#ffd7d5"                  # restart box tint when the path does not exist
 SAY_SAVE_MS = 800                        # idle time after typing before the phrase is saved
 EAR = "👂"                        # preview button
 # row background per state; "idle" means the panel's normal background
@@ -81,6 +84,10 @@ SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE = 3, 6, 9
 GW_OWNER = 4
 MOUSEEVENTF_MOVE, MOUSEEVENTF_WHEEL = 0x0001, 0x0800
 CREATE_NO_WINDOW = 0x08000000            # keep PowerShell from flashing a console
+DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP = 0x00000008, 0x00000200
+TH32CS_SNAPPROCESS = 0x00000002
+PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE = 0x1000, 0x0001
+WM_CLOSE = 0x0010
 FLASHW_STOP, FLASHW_ALL, FLASHW_TIMERNOFG = 0x0, 0x3, 0xC
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_ICON, NIF_TIP, NIF_INFO = 0x02, 0x04, 0x10
@@ -181,6 +188,14 @@ def send_mouse(flags, data=0, dx=0, dy=0):
     user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
 
 
+class PROCESSENTRY32W(ctypes.Structure):
+    _fields_ = [("dwSize", wt.DWORD), ("cntUsage", wt.DWORD), ("th32ProcessID", wt.DWORD),
+                ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)), ("th32ModuleID", wt.DWORD),
+                ("cntThreads", wt.DWORD), ("th32ParentProcessID", wt.DWORD),
+                ("pcPriClassBase", ctypes.c_long), ("dwFlags", wt.DWORD),
+                ("szExeFile", wt.WCHAR * 260)]
+
+
 class FLASHWINFO(ctypes.Structure):
     _fields_ = [("cbSize", wt.UINT), ("hwnd", wt.HWND), ("dwFlags", wt.DWORD),
                 ("uCount", wt.UINT), ("dwTimeout", wt.DWORD)]
@@ -196,6 +211,8 @@ class NOTIFYICONDATA(ctypes.Structure):
 
 # HANDLE-returning calls must say so, or the value is truncated on 64-bit
 user32.LoadImageW.restype = wt.HANDLE
+kernel32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+kernel32.OpenProcess.restype = wt.HANDLE
 user32.LoadIconW.restype = wt.HICON
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
@@ -357,16 +374,17 @@ def read_prefs():
         with open(PREFS_PATH) as f:
             d = json.load(f)
         vol = int(d.get("volume", VOLUME_DEFAULT))
-        return set(d.get("muted", [])), dict(d.get("say", {})), max(0, min(100, vol))
+        return (set(d.get("muted", [])), dict(d.get("say", {})),
+                dict(d.get("run", {})), max(0, min(100, vol)))
     except Exception:
-        return set(), {}, VOLUME_DEFAULT
+        return set(), {}, {}, VOLUME_DEFAULT
 
 
-def write_prefs(muted, say, volume):
+def write_prefs(muted, say, run, volume):
     try:
         os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
         with open(PREFS_PATH, "w") as f:
-            json.dump({"muted": sorted(muted), "say": say, "volume": volume}, f)
+            json.dump({"muted": sorted(muted), "say": say, "run": run, "volume": volume}, f)
     except Exception:
         pass                        # a preference is not worth crashing the panel over
 
@@ -377,6 +395,114 @@ def clear_status(project):
         os.remove(os.path.join(STATUS_DIR, safe + ".json"))
     except OSError:
         pass
+
+
+# ---- close and reopen an app ------------------------------------------------
+def process_path(pid):
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return None                 # protected or already gone
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        size = wt.DWORD(len(buf))
+        if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return buf.value
+    finally:
+        kernel32.CloseHandle(h)
+    return None
+
+
+ALIAS_IMAGE = {}                # configured path -> what it really runs as, learned on launch
+
+
+def pids_of(path):
+    """PIDs whose executable is exactly `path`.  Matched on the full path rather than
+    the file name, so another copy of the same-named exe elsewhere is never touched -
+    matching by name would make a target like python.exe catastrophic.
+
+    Also matches the image a Windows execution alias resolves to, once we have seen it:
+    launching the notepad.exe in System32 really runs Notepad from WindowsApps,
+    and a strict path comparison would never recognise its own instances."""
+    target = os.path.normcase(os.path.abspath(path))
+    wanted = {target, ALIAS_IMAGE.get(target)} - {None}
+    base = os.path.basename(target)
+    me, found = os.getpid(), []
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == wt.HANDLE(-1).value:
+        return found
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            pid = entry.th32ProcessID
+            # compare the cheap name first; only then open the process for its full path
+            if pid != me and os.path.normcase(entry.szExeFile) == base:
+                full = process_path(pid)
+                if full and os.path.normcase(full) in wanted:
+                    found.append(pid)
+            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+    return found
+
+
+def windows_of(pid):
+    out = []
+
+    @EnumWindowsProc
+    def each(hwnd, _):
+        got = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(got))
+        if got.value == pid and user32.IsWindowVisible(hwnd):
+            out.append(hwnd)
+        return True
+
+    user32.EnumWindows(each, 0)
+    return out
+
+
+def close_app(path):
+    """Ask every instance to close, then terminate any that ignored it."""
+    pids = pids_of(path)
+    for pid in pids:
+        for hwnd in windows_of(pid):
+            user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)    # let it shut down tidily first
+    if pids:
+        time.sleep(RESTART_GRACE_MS / 1000)
+    for pid in pids_of(path):                            # whatever is still standing
+        h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+        if h:
+            kernel32.TerminateProcess(h, 0)
+            kernel32.CloseHandle(h)
+    return len(pids)
+
+
+def launch_app(path):
+    """Start it, then note what it actually runs as, so the next restart recognises it
+    even when the path given is an execution alias pointing somewhere else."""
+    proc = subprocess.Popen([path], cwd=os.path.dirname(path) or None, close_fds=True,
+                            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+    key = os.path.normcase(os.path.abspath(path))
+    for _ in range(20):
+        image = process_path(proc.pid)
+        if image:
+            if os.path.normcase(image) != key:
+                ALIAS_IMAGE[key] = os.path.normcase(image)
+            return
+        time.sleep(0.1)
+
+
+def restart_app(path):
+    """Close every instance of `path`, then start it again.  Runs on a worker thread:
+    it sleeps through the grace period and must not block the UI."""
+    if not os.path.isfile(path):
+        return
+    try:
+        close_app(path)
+        launch_app(path)
+    except Exception:
+        pass                        # a failed restart must not take the panel down
 
 
 # ---- notifications ---------------------------------------------------------
@@ -536,9 +662,9 @@ class Panel(tk.Tk):
         except Exception:
             pass
         # prefs first: the volume slider below is built from them
-        self.muted, self.say, self.volume = read_prefs()
+        self.muted, self.say, self.run, self.volume = read_prefs()
         self._vol_job = None                # pending debounced save of the volume
-        self._say_job = None                # pending debounced save of a phrase
+        self._jobs = {}                     # pending debounced saves, per text field
 
         self.attributes("-topmost", True)
         self.resizable(False, False)
@@ -608,7 +734,7 @@ class Panel(tk.Tk):
             return user32.GetParent(self.winfo_id()) or self.winfo_id()
 
     def close(self):
-        write_prefs(self.muted, self.say, self.volume)   # flush anything inside a debounce
+        write_prefs(self.muted, self.say, self.run, self.volume)   # flush anything mid-debounce
         self._tray.remove()
         self.destroy()
 
@@ -684,12 +810,14 @@ class Panel(tk.Tk):
                 say = tk.Entry(row, width=SAY_WIDTH)    # the phrase, underneath
                 say.insert(0, self.say.get(proj, ""))
                 say.pack(fill="x", padx=1, pady=(0, 2))
-                say.bind("<KeyRelease>", lambda e, p=proj, w=say: self.say_typed(p, w))
-                say.bind("<Return>",     lambda e, p=proj, w=say: self.say_done(p, w, leave=True))
-                say.bind("<FocusOut>",   lambda e, p=proj, w=say: self.say_done(p, w))
+                self._bind_field("say", proj, say)
+                run = tk.Entry(row, width=SAY_WIDTH)    # app to restart when it finishes
+                run.insert(0, self.run.get(proj, ""))
+                run.pack(fill="x", padx=1, pady=(0, 2))
+                self._bind_field("run", proj, run)
                 # a list: two windows can share a folder name, and the hook writes one
                 # status file per name, so both rows must show that same state
-                self.rows.setdefault(proj, []).append((row, head, btn, mute, say))
+                self.rows.setdefault(proj, []).append((row, head, btn, mute, say, run))
             if not wins:
                 tk.Label(self.list, text="no VS Code windows").pack()
         self.update_lights()
@@ -717,11 +845,14 @@ class Panel(tk.Tk):
             muted = proj in self.muted
             icon = SOUND_OFF if muted else SOUND_ON
             sound_bg = SOUND_OFF_BG if muted else SOUND_ON_BG
-            for row, head, btn, mute, _say in widgets:
+            path = self.run.get(proj, "").strip()
+            bad = bool(path) and not os.path.isfile(path)   # say so, rather than silently no-op
+            for row, head, btn, mute, _say, run in widgets:
                 row.configure(bg=colour)
                 head.configure(bg=colour)
                 btn.configure(bg=colour, activebackground=colour)
                 mute.configure(text=icon, bg=sound_bg, activebackground=sound_bg)
+                run.configure(bg=BAD_PATH_BG if bad else "white")
 
     def volume_changed(self, value):
         """Fires on every pixel of the drag, so the real work is debounced."""
@@ -734,7 +865,7 @@ class Panel(tk.Tk):
         """Save, and re-render every phrase at the new level in the background - so the
         next alert speaks straight away instead of falling back to a beep once."""
         self._vol_job = None
-        write_prefs(self.muted, self.say, self.volume)
+        write_prefs(self.muted, self.say, self.run, self.volume)
         for text in set(self.say.values()):
             text = text.strip()
             if text and not os.path.exists(say_wav(text, self.volume)):
@@ -751,42 +882,52 @@ class Panel(tk.Tk):
         render_speech(name, volume)         # usually already cached; cheap when not
         speak(name, volume)
 
-    def say_typed(self, project, entry):
+    def _bind_field(self, which, project, entry):
+        """Both boxes behave alike: saved as you type, Enter leaves the box."""
+        entry.bind("<KeyRelease>", lambda e: self.field_typed(which, project, entry))
+        entry.bind("<Return>",     lambda e: self.field_done(which, project, entry, leave=True))
+        entry.bind("<FocusOut>",   lambda e: self.field_done(which, project, entry))
+
+    def field_typed(self, which, project, entry):
         """Mirror each keystroke into memory - so a row rebuild mid-sentence restores
         what you had - and queue a save.  Debounced rather than tied to Enter or
-        focus-out: typing a phrase and then shutting down used to lose it."""
-        self.say[project] = entry.get()
-        if self._say_job:
-            self.after_cancel(self._say_job)
-        self._say_job = self.after(SAY_SAVE_MS, lambda p=project: self.say_store(p))
+        focus-out: typing and then shutting down used to lose it."""
+        getattr(self, which)[project] = entry.get()
+        job = self._jobs.get(which)
+        if job:
+            self.after_cancel(job)
+        self._jobs[which] = self.after(SAY_SAVE_MS, lambda: self.field_store(which, project))
 
-    def say_done(self, project, entry, leave=False):
+    def field_done(self, which, project, entry, leave=False):
         """Enter or clicking away: save now rather than waiting out the debounce."""
-        self.say[project] = entry.get()
-        self.say_store(project)
+        getattr(self, which)[project] = entry.get()
+        self.field_store(which, project)
         if leave:
             entry.selection_clear()
             self.focus_set()            # Enter drops you out of the box
             return "break"
 
-    def say_store(self, project):
-        """Persist the phrase and render it, once, off the UI thread."""
-        if self._say_job:
-            self.after_cancel(self._say_job)
-            self._say_job = None
-        text = self.say.get(project, "").strip()
+    def field_store(self, which, project):
+        """Persist, and for a phrase render it once, off the UI thread."""
+        job = self._jobs.pop(which, None)
+        if job:
+            self.after_cancel(job)
+        store = getattr(self, which)
+        text = store.get(project, "").strip()
+        if which == "run":
+            text = text.strip(chr(34))  # Explorer's "Copy as path" wraps it in quotes
         if text:
-            self.say[project] = text
+            store[project] = text
         else:
-            self.say.pop(project, None)
-        write_prefs(self.muted, self.say, self.volume)
-        if text and not os.path.exists(say_wav(text, self.volume)):
+            store.pop(project, None)
+        write_prefs(self.muted, self.say, self.run, self.volume)
+        if which == "say" and text and not os.path.exists(say_wav(text, self.volume)):
             threading.Thread(target=render_speech, args=(text, self.volume), daemon=True).start()
 
     def toggle_sound(self, project):
         """Switch this project's green/red sound on or off, and remember it."""
         self.muted.symmetric_difference_update({project})
-        write_prefs(self.muted, self.say, self.volume)
+        write_prefs(self.muted, self.say, self.run, self.volume)
         self.update_lights()
 
     def alert(self, project, state):
@@ -796,6 +937,10 @@ class Panel(tk.Tk):
             # the phrase is for "it has stopped"; red keeps its own falling tone
             if not (state == "done" and text and speak(text, self.volume)):
                 play_alert(state, self.volume)
+        if state == "done":
+            path = self.run.get(project, "").strip()
+            if path:                    # threaded: close_app sleeps out the grace period
+                threading.Thread(target=restart_app, args=(path,), daemon=True).start()
         if NOTIFY_TOAST:
             self._tray.notify("Claude Code",
                               "%s: %s" % (project, "finished" if state == "done" else "needs you"))
