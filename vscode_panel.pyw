@@ -55,11 +55,14 @@ SOUND_ON_BG, SOUND_OFF_BG = "#1f6feb", "#e5484d"      # blue when sounding, red 
 SOUND_FONT = ("Segoe UI Emoji", 14)
 # (frequency Hz, milliseconds) per alert.  Rising = finished, falling = wants you.
 SOUND_TONES = {"done": [(660, 90), (880, 150)], "waiting": [(760, 90), (570, 170)]}
-SOUND_VOLUME = 0.35                      # 0-1, of full scale
+SOUND_PEAK = 0.6                         # tone amplitude at slider 100, of full scale
+VOLUME_DEFAULT = 60                      # slider 0-100; 60 matches the old fixed level
+VOLUME_SAVE_MS = 500                     # idle after dragging before saving and re-rendering
 SPEAK_VOICE = ""                         # "" = Windows default; e.g. "Microsoft Zira Desktop"
 SPEAK_RATE = 0                           # SAPI rate, -10 (slow) to 10 (fast)
 SAY_WIDTH = 14                           # minimum width of the spoken-text box, in characters
 SAY_SAVE_MS = 800                        # idle time after typing before the phrase is saved
+EAR = "👂"                        # preview button
 # row background per state; "idle" means the panel's normal background
 STATUS_COLORS = {"idle": None, "working": "#f0b429", "done": "#3ad35a", "waiting": "#ff5a4d"}
 NOTIFY_ON = ("done", "waiting")          # states that raise an alert; set to () to stay silent
@@ -349,20 +352,21 @@ def read_statuses():
 
 
 def read_prefs():
-    """(projects you have muted, {project: phrase to speak when it finishes})"""
+    """(muted projects, {project: phrase spoken when it finishes}, volume 0-100)"""
     try:
         with open(PREFS_PATH) as f:
             d = json.load(f)
-        return set(d.get("muted", [])), dict(d.get("say", {}))
+        vol = int(d.get("volume", VOLUME_DEFAULT))
+        return set(d.get("muted", [])), dict(d.get("say", {})), max(0, min(100, vol))
     except Exception:
-        return set(), {}
+        return set(), {}, VOLUME_DEFAULT
 
 
-def write_prefs(muted, say):
+def write_prefs(muted, say, volume):
     try:
         os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
         with open(PREFS_PATH, "w") as f:
-            json.dump({"muted": sorted(muted), "say": say}, f)
+            json.dump({"muted": sorted(muted), "say": say, "volume": volume}, f)
     except Exception:
         pass                        # a preference is not worth crashing the panel over
 
@@ -383,7 +387,7 @@ def flash_taskbar(hwnd, on=True):
     user32.FlashWindowEx(ctypes.byref(fw))
 
 
-def write_tone(path, tones, rate=44100):
+def write_tone(path, tones, volume, rate=44100):
     """A small WAV of (freq, ms) tones, each under a raised-cosine envelope so the
     edges do not click.  Generated rather than shipped, like the icon."""
     frames = array.array("h")
@@ -391,7 +395,8 @@ def write_tone(path, tones, rate=44100):
         n = int(rate * ms / 1000)
         for i in range(n):
             env = 0.5 - 0.5 * math.cos(2 * math.pi * min(i, n - i) / n)
-            frames.append(int(32767 * SOUND_VOLUME * env * math.sin(2 * math.pi * freq * i / rate)))
+            frames.append(int(32767 * SOUND_PEAK * volume / 100 * env
+                              * math.sin(2 * math.pi * freq * i / rate)))
     with wave.open(path, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
@@ -399,10 +404,10 @@ def write_tone(path, tones, rate=44100):
         w.writeframes(frames.tobytes())
 
 
-def alert_wav(state):
-    path = os.path.join(tempfile.gettempdir(), "vscode_panel_%s.wav" % state)
+def alert_wav(state, volume):
+    path = os.path.join(tempfile.gettempdir(), "vscode_panel_%s_%d.wav" % (state, volume))
     if not os.path.exists(path):
-        write_tone(path, SOUND_TONES.get(state, SOUND_TONES["done"]))
+        write_tone(path, SOUND_TONES.get(state, SOUND_TONES["done"]), volume)
     return path
 
 
@@ -411,24 +416,26 @@ def ps_quote(text):
     return "'" + str(text).replace("'", "''") + "'"
 
 
-def say_wav(text):
-    """Where the rendering of this phrase lives.  Keyed by content, so editing the
-    text renders a new file and leaves the old one harmlessly cached."""
+def say_wav(text, volume):
+    """Where this phrase at this volume lives.  Keyed by both: PlaySound has no volume
+    control, so level must be baked in at synthesis, and keying the cache this way keeps
+    playback a plain PlaySound rather than rewriting the file on every play."""
     digest = hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
-    return os.path.join(tempfile.gettempdir(), "vscode_panel_say_%s.wav" % digest)
+    return os.path.join(tempfile.gettempdir(), "vscode_panel_say_%s_%d.wav" % (digest, volume))
 
 
-def render_speech(text):
+def render_speech(text, volume):
     """Synthesise `text` to a cached WAV with SAPI, via PowerShell so the panel keeps
     to the standard library.  Done once when you edit the text - never at alert time,
     where it would add a second of latency - so speaking then costs no more than a beep."""
-    path = say_wav(text)
+    path = say_wav(text, volume)
     if os.path.exists(path):
         return path
     script = ("Add-Type -AssemblyName System.Speech;"
               "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;"
               + ("$s.SelectVoice(%s);" % ps_quote(SPEAK_VOICE) if SPEAK_VOICE else "")
               + "$s.Rate = %d;" % SPEAK_RATE
+              + "$s.Volume = %d;" % volume
               + "$s.SetOutputToWaveFile(%s);" % ps_quote(path)
               + "$s.Speak(%s);" % ps_quote(text)
               + "$s.Dispose()")
@@ -441,10 +448,13 @@ def render_speech(text):
     return path if os.path.exists(path) else None
 
 
-def speak(text):
-    """Play the cached rendering of `text`.  Falls back to the beep if it is missing."""
-    path = say_wav(text)
+def speak(text, volume):
+    """Play the cached rendering of `text`.  If this volume has not been rendered yet,
+    start it in the background and report failure, so the caller beeps this once and
+    speaks from then on."""
+    path = say_wav(text, volume)
     if not os.path.exists(path):
+        threading.Thread(target=render_speech, args=(text, volume), daemon=True).start()
         return False
     try:
         winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
@@ -453,12 +463,12 @@ def speak(text):
         return False
 
 
-def play_alert(state):
+def play_alert(state, volume):
     """Play our own WAV rather than MessageBeep.  MessageBeep plays whatever the
     Windows sound scheme maps to SystemAsterisk / SystemExclamation, so on a machine
     set to "No Sounds" - normal on an audio workstation - it is silent."""
     try:
-        winsound.PlaySound(alert_wav(state),
+        winsound.PlaySound(alert_wav(state, volume),
                            winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
     except Exception:
         winsound.MessageBeep()
@@ -525,6 +535,11 @@ class Panel(tk.Tk):
             self.iconbitmap(icon_path())
         except Exception:
             pass
+        # prefs first: the volume slider below is built from them
+        self.muted, self.say, self.volume = read_prefs()
+        self._vol_job = None                # pending debounced save of the volume
+        self._say_job = None                # pending debounced save of a phrase
+
         self.attributes("-topmost", True)
         self.resizable(False, False)
         self.configure(padx=6, pady=6)
@@ -555,6 +570,17 @@ class Panel(tk.Tk):
             b.pack(side="left", padx=2, fill="x", expand=True)
             self.buttons.append(b)
 
+        vol = tk.Frame(self)
+        vol.pack(fill="x", pady=(4, 0))
+        self.ear = tk.Button(vol, text=EAR, font=SOUND_FONT, width=2, command=self.preview)
+        self.ear.pack(side="left", padx=2)
+        self.buttons.append(self.ear)
+        self.vol_scale = tk.Scale(vol, from_=0, to=100, orient="horizontal", showvalue=True,
+                                  label="Voice volume", font=("Segoe UI", 7),
+                                  command=self.volume_changed)
+        self.vol_scale.set(self.volume)
+        self.vol_scale.pack(side="left", fill="x", expand=True, padx=2)
+
         self.progress = ttk.Progressbar(self, mode="determinate")
         self.progress.pack(fill="x", pady=(6, 0))
 
@@ -567,8 +593,6 @@ class Panel(tk.Tk):
         # over from a previous run does not fire the moment the panel starts
         self._states = read_statuses()
         self._bg = self.cget("bg")          # what an idle row looks like
-        self.muted, self.say = read_prefs()  # muted projects, and what to speak for each
-        self._say_job = None                # pending debounced save of a phrase
         self._hwnd = self.panel_hwnd()
         self._tray = Tray(self._hwnd)
         self.protocol("WM_DELETE_WINDOW", self.close)
@@ -584,7 +608,7 @@ class Panel(tk.Tk):
             return user32.GetParent(self.winfo_id()) or self.winfo_id()
 
     def close(self):
-        write_prefs(self.muted, self.say)       # flush a phrase still inside the debounce
+        write_prefs(self.muted, self.say, self.volume)   # flush anything inside a debounce
         self._tray.remove()
         self.destroy()
 
@@ -699,6 +723,34 @@ class Panel(tk.Tk):
                 btn.configure(bg=colour, activebackground=colour)
                 mute.configure(text=icon, bg=sound_bg, activebackground=sound_bg)
 
+    def volume_changed(self, value):
+        """Fires on every pixel of the drag, so the real work is debounced."""
+        self.volume = int(float(value))
+        if self._vol_job:
+            self.after_cancel(self._vol_job)
+        self._vol_job = self.after(VOLUME_SAVE_MS, self.volume_settled)
+
+    def volume_settled(self):
+        """Save, and re-render every phrase at the new level in the background - so the
+        next alert speaks straight away instead of falling back to a beep once."""
+        self._vol_job = None
+        write_prefs(self.muted, self.say, self.volume)
+        for text in set(self.say.values()):
+            text = text.strip()
+            if text and not os.path.exists(say_wav(text, self.volume)):
+                threading.Thread(target=render_speech, args=(text, self.volume), daemon=True).start()
+
+    def preview(self):
+        """Speak the name of the top project, so you can set the level by ear."""
+        if not self.rows:
+            return
+        name = next(iter(self.rows))
+        threading.Thread(target=self._preview, args=(name, self.volume), daemon=True).start()
+
+    def _preview(self, name, volume):
+        render_speech(name, volume)         # usually already cached; cheap when not
+        speak(name, volume)
+
     def say_typed(self, project, entry):
         """Mirror each keystroke into memory - so a row rebuild mid-sentence restores
         what you had - and queue a save.  Debounced rather than tied to Enter or
@@ -727,14 +779,14 @@ class Panel(tk.Tk):
             self.say[project] = text
         else:
             self.say.pop(project, None)
-        write_prefs(self.muted, self.say)
-        if text and not os.path.exists(say_wav(text)):
-            threading.Thread(target=render_speech, args=(text,), daemon=True).start()
+        write_prefs(self.muted, self.say, self.volume)
+        if text and not os.path.exists(say_wav(text, self.volume)):
+            threading.Thread(target=render_speech, args=(text, self.volume), daemon=True).start()
 
     def toggle_sound(self, project):
         """Switch this project's green/red sound on or off, and remember it."""
         self.muted.symmetric_difference_update({project})
-        write_prefs(self.muted, self.say)
+        write_prefs(self.muted, self.say, self.volume)
         self.update_lights()
 
     def alert(self, project, state):
@@ -742,8 +794,8 @@ class Panel(tk.Tk):
         if NOTIFY_SOUND and project not in self.muted:
             text = self.say.get(project, "").strip()
             # the phrase is for "it has stopped"; red keeps its own falling tone
-            if not (state == "done" and text and speak(text)):
-                play_alert(state)
+            if not (state == "done" and text and speak(text, self.volume)):
+                play_alert(state, self.volume)
         if NOTIFY_TOAST:
             self._tray.notify("Claude Code",
                               "%s: %s" % (project, "finished" if state == "done" else "needs you"))

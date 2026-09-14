@@ -49,6 +49,13 @@ The speaker keeps its own blue/red background rather than taking the row's statu
 
 The muted set cannot live on the widgets, because `refresh()` destroys and rebuilds every row whenever a window opens or closes. It lives in `Panel.muted` and is written to `%APPDATA%\vscode_panel\prefs.json` on each click — deliberately *not* alongside the status files in `%TEMP%`, which are disposable, while a preference should outlive a reboot or a temp sweep. A failed read or write is swallowed: a preference is not worth crashing the panel over.
 
+### Volume and preview
+Under the three buttons sit a **voice volume** slider and an **ear** button. The ear speaks the name of the top project in the list, so you can set the level by ear without waiting for a conversation to finish.
+
+`PlaySound` has no volume control, so the level has to be baked in at synthesis: `$s.Volume` for speech, and the sample amplitude for the tones. Both caches are therefore keyed by *(content, volume)* rather than content alone, which keeps playback a plain `PlaySound` on a cached file instead of rewriting a WAV on every play. Tone amplitude is `SOUND_PEAK * volume / 100`, so the default 60 reproduces the old fixed 0.35 of full scale and there is headroom above it.
+
+Dragging fires the callback on every pixel, so saving and re-rendering are debounced by `VOLUME_SAVE_MS`. When the drag settles, every stored phrase is re-rendered at the new level in the background — otherwise the next alert would find no cached file and fall back to a beep once before catching up.
+
 ### Spoken phrase per project
 Under each row is a text box, spanning its full width. Whatever you type there is **spoken when that project turns green**; leave it empty and you get the plain rising tone instead. Red keeps its falling tone either way, so "finished" and "needs you" never sound alike.
 
