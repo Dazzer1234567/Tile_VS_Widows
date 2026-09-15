@@ -70,7 +70,7 @@ Under the spoken-phrase box is a second box: put the **full path to an executabl
 
 Instances are matched on the **full image path**, never on the file name. That distinction is the whole safety story: matching `python.exe` or `node.exe` by name would kill unrelated processes across the machine, whereas a full-path match cannot touch another copy of the same-named exe living elsewhere. The panel's own process is skipped too.
 
-Closing is `WM_CLOSE` to each visible window first, so the app can shut down tidily, then `TerminateProcess` after `RESTART_GRACE_MS` for anything that ignored it. **It is a force-kill in the end — do not point this at something holding unsaved work.** All of it runs on a worker thread, since it sleeps out the grace period.
+Closing is `WM_CLOSE` to each visible window first, so the app can shut down tidily, then `TerminateProcess` for anything that ignored it — and then the whole sweep repeats, up to `rounds` times, because one pass is not reliable: an app can spawn a replacement as it exits, a launcher can start the real process a moment later, and an instance still opening when the first sweep ran would be missed. The wait ends as soon as everything has gone rather than always sitting out `RESTART_GRACE_MS`. Restarts are serialised on a lock, so two finishes close together cannot interleave, one thread's sweep killing the instance the other just launched. **It is a force-kill in the end — do not point this at something holding unsaved work.** All of it runs on a worker thread, since it sleeps out the grace period.
 
 Two limits worth knowing:
 
@@ -94,7 +94,7 @@ Details that matter:
 
 - The toast needs a tray icon to come from, so `Tray` registers one lazily on the first alert (using the same embedded `.ico`) and removes it on quit — closing via the window's X or right-clicking the drag bar both go through `close()`, so no ghost icon is left behind.
 - `_states` is seeded from disk in `__init__`, so a status file left over from a previous run doesn't fire an alert the moment the panel starts.
-- Only changes *into* an alert state fire; `working` → `working` is silent, and re-reading the same `done` doesn't re-alert.
+- An event is identified by **(state, timestamp)**, not by state alone. Two Stops in a row write the same state, and comparing states would see no change and fire nothing — which happened whenever the `working` in between was not caught by the poll, i.e. any turn shorter than `REFRESH_MS`. That silently skipped the phrase *and* the app restart, and was the cause of restarts being unreliable. The hook stamps every event, so the timestamp settles it.
 - **Nothing blinks.** Every row colour is steady; the panel is meant to be read out of the corner of your eye, and movement there pulls focus rather than informing. The four states are amber (working), green (stopped, not yet looked at), red (waiting on you) and unfilled (nothing to report, or you have opened it since).
 - "Not yet looked at" needs no extra bookkeeping: the status file *is* that state. Clicking Max deletes it, which is what returns the row to unfilled.
 - Clicking Max only clears a state that has *settled*. `working` is still in progress, so opening that window leaves it amber — it stays amber until the hook reports the window finished. Only `done` and `waiting` are cleared by a click.

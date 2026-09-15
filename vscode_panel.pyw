@@ -354,7 +354,12 @@ def scroll_steps(wins):
 
 
 def read_statuses():
-    """{project name: state} from the files claude_hook.py writes."""
+    """{project name: (state, timestamp)} from the files claude_hook.py writes.
+
+    The timestamp matters: two Stops in a row write the same state, and comparing
+    states alone would see no change and fire nothing.  That happens whenever the
+    "working" in between is not caught by the poll - any turn shorter than
+    REFRESH_MS - so the phrase and the app restart were silently skipped."""
     out = {}
     if not os.path.isdir(STATUS_DIR):
         return out
@@ -362,7 +367,7 @@ def read_statuses():
         try:
             with open(os.path.join(STATUS_DIR, fn)) as f:
                 d = json.load(f)
-            out[d["project"]] = d["state"]
+            out[d["project"]] = (d["state"], d.get("time", 0))
         except Exception:
             pass
     return out
@@ -462,20 +467,31 @@ def windows_of(pid):
     return out
 
 
-def close_app(path):
-    """Ask every instance to close, then terminate any that ignored it."""
-    pids = pids_of(path)
-    for pid in pids:
-        for hwnd in windows_of(pid):
-            user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)    # let it shut down tidily first
-    if pids:
-        time.sleep(RESTART_GRACE_MS / 1000)
-    for pid in pids_of(path):                            # whatever is still standing
-        h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
-        if h:
-            kernel32.TerminateProcess(h, 0)
-            kernel32.CloseHandle(h)
-    return len(pids)
+def close_app(path, rounds=3):
+    """Ask every instance to close, terminate any that ignored it, then check again.
+
+    One pass is not enough to be reliable: an app can spawn a replacement as it exits,
+    a launcher can start the real process a moment later, and an instance still opening
+    when the first sweep ran would be missed entirely."""
+    closed = 0
+    for _ in range(rounds):
+        pids = pids_of(path)
+        if not pids:
+            break
+        closed = max(closed, len(pids))
+        for pid in pids:
+            for hwnd in windows_of(pid):
+                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)   # let it shut down tidily
+        deadline = time.time() + RESTART_GRACE_MS / 1000    # no longer than it needs
+        while time.time() < deadline and pids_of(path):
+            time.sleep(0.1)
+        for pid in pids_of(path):                           # whatever is still standing
+            h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+            if h:
+                kernel32.TerminateProcess(h, 0)
+                kernel32.CloseHandle(h)
+        time.sleep(0.25)                                    # let the kernel reap them
+    return closed
 
 
 def launch_app(path):
@@ -493,16 +509,23 @@ def launch_app(path):
         time.sleep(0.1)
 
 
+RESTART_LOCK = threading.Lock()
+
+
 def restart_app(path):
     """Close every instance of `path`, then start it again.  Runs on a worker thread:
-    it sleeps through the grace period and must not block the UI."""
+    it sleeps through the grace period and must not block the UI.
+
+    Serialised, because two finishes close together would otherwise interleave - one
+    thread's sweep killing the instance the other had just launched."""
     if not os.path.isfile(path):
         return
-    try:
-        close_app(path)
-        launch_app(path)
-    except Exception:
-        pass                        # a failed restart must not take the panel down
+    with RESTART_LOCK:
+        try:
+            close_app(path)
+            launch_app(path)
+        except Exception:
+            pass                    # a failed restart must not take the panel down
 
 
 # ---- notifications ---------------------------------------------------------
@@ -828,7 +851,7 @@ class Panel(tk.Tk):
         # Opening a window only settles a state that has stopped changing.  "working"
         # is still in progress, so it stays amber until the hook says otherwise -
         # clearing it would blank the row while Claude is still going.
-        if read_statuses().get(project) != "working":
+        if read_statuses().get(project, ("idle", 0))[0] != "working":
             clear_status(project)       # you've looked at it; the row goes back to plain
             self._states.pop(project, None)
         self.stop_flash()
@@ -836,12 +859,12 @@ class Panel(tk.Tk):
 
     def update_lights(self):
         states = read_statuses()
-        for proj, state in states.items():
-            if state in NOTIFY_ON and self._states.get(proj) != state:
+        for proj, (state, stamp) in states.items():
+            if state in NOTIFY_ON and self._states.get(proj) != (state, stamp):
                 self.alert(proj, state)
         self._states = states
         for proj, widgets in getattr(self, "rows", {}).items():
-            colour = STATUS_COLORS.get(states.get(proj, "idle")) or self._bg
+            colour = STATUS_COLORS.get(states.get(proj, ("idle", 0))[0]) or self._bg
             muted = proj in self.muted
             icon = SOUND_OFF if muted else SOUND_ON
             sound_bg = SOUND_OFF_BG if muted else SOUND_ON_BG
