@@ -68,7 +68,7 @@ A related fix was needed to make the box usable at all: `refresh()` rebuilt ever
 ### Restart an app when a project finishes
 Under the spoken-phrase box is a second box: put the **full path to an executable** in it and, when that project turns green, every instance of it is closed and one is started again. Useful for a test build you want relaunched on each pass. The box turns pink while the path does not point at a file, so a typo says so instead of silently doing nothing. Quotes are stripped, so Explorer's *Copy as path* can be pasted straight in.
 
-The restart waits `RESTART_DELAY_MS` (10s) after the conversation stops before touching anything, so the app is not closed while it is still settling.
+The restart waits `RESTART_DELAY_MS` (4s) after the conversation stops before touching anything, so the app is not closed while it is still settling.
 
 **Why two instances kept appearing.** Rebuilding the app while it is running does not stop the old process — Windows lets the exe be renamed out from under it, and the build moves it to the Recycle Bin. The running process then reports an image path like `C:\$Recycle.Bin\S-1-5-21-…\.<mangled>`, which no longer equals the configured path, so a strict comparison stopped recognising it. The old build was never closed and a fresh one was launched beside it — every rebuild, forever. `scan_for()` now matches three ways: the configured path, any PID the panel launched itself (`LAUNCHED`), and a same-named process whose own image has gone (`stale_image()` — unreadable, renamed, or no longer on disk). The third is what catches an instance you started yourself before a rebuild.
 

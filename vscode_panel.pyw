@@ -64,7 +64,7 @@ SPEAK_VOICE = ""                         # "" = Windows default; e.g. "Microsoft
 SPEAK_RATE = 0                           # SAPI rate, -10 (slow) to 10 (fast)
 SAY_WIDTH = 14                           # minimum width of the spoken-text box, in characters
 RESTART_GRACE_MS = 1500                  # how long an app gets to close itself before being killed
-RESTART_DELAY_MS = 10000                 # settle time after a conversation stops, before restarting
+RESTART_DELAY_MS = 4000                  # settle time after a conversation stops, before restarting
 LOG_MAX_BYTES = 1000000                  # panel.log is rolled to panel.log.1 past this
 BAD_PATH_BG = "#ffd7d5"                  # restart box tint when the path does not exist
 SAY_SAVE_MS = 800                        # idle time after typing before the phrase is saved
