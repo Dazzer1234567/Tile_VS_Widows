@@ -68,7 +68,11 @@ A related fix was needed to make the box usable at all: `refresh()` rebuilt ever
 ### Restart an app when a project finishes
 Under the spoken-phrase box is a second box: put the **full path to an executable** in it and, when that project turns green, every instance of it is closed and one is started again. Useful for a test build you want relaunched on each pass. The box turns pink while the path does not point at a file, so a typo says so instead of silently doing nothing. Quotes are stripped, so Explorer's *Copy as path* can be pasted straight in.
 
-Instances are matched on the **full image path**, never on the file name. That distinction is the whole safety story: matching `python.exe` or `node.exe` by name would kill unrelated processes across the machine, whereas a full-path match cannot touch another copy of the same-named exe living elsewhere. The panel's own process is skipped too.
+The restart waits `RESTART_DELAY_MS` (10s) after the conversation stops before touching anything, so the app is not closed while it is still settling.
+
+**Why two instances kept appearing.** Rebuilding the app while it is running does not stop the old process — Windows lets the exe be renamed out from under it, and the build moves it to the Recycle Bin. The running process then reports an image path like `C:\$Recycle.Bin\S-1-5-21-…\.<mangled>`, which no longer equals the configured path, so a strict comparison stopped recognising it. The old build was never closed and a fresh one was launched beside it — every rebuild, forever. `scan_for()` now matches three ways: the configured path, any PID the panel launched itself (`LAUNCHED`), and a same-named process whose own image has gone (`stale_image()` — unreadable, renamed, or no longer on disk). The third is what catches an instance you started yourself before a rebuild.
+
+Instances are otherwise matched on the **full image path**, never on the file name. That distinction is the whole safety story: matching `python.exe` or `node.exe` by name would kill unrelated processes across the machine, whereas a full-path match cannot touch another copy of the same-named exe living elsewhere. The panel's own process is skipped too.
 
 Closing is `WM_CLOSE` to each visible window first, so the app can shut down tidily, then `TerminateProcess` for anything that ignored it — and then the whole sweep repeats, up to `rounds` times, because one pass is not reliable: an app can spawn a replacement as it exits, a launcher can start the real process a moment later, and an instance still opening when the first sweep ran would be missed. The wait ends as soon as everything has gone rather than always sitting out `RESTART_GRACE_MS`. Restarts are serialised on a lock, so two finishes close together cannot interleave, one thread's sweep killing the instance the other just launched. **It is a force-kill in the end — do not point this at something holding unsaved work.** All of it runs on a worker thread, since it sleeps out the grace period.
 
@@ -76,6 +80,9 @@ Two limits worth knowing:
 
 - **Path only, no arguments.** The whole string is taken as the executable.
 - **Windows execution aliases** (Store apps, winget stubs) run from a different image path than the one you launch: the `notepad.exe` in System32 actually runs from `WindowsApps`. A strict comparison cannot match those, so the first restart of such an app closes nothing. `launch_app()` records what the alias really resolved to, so every restart after that works. Ordinary installed applications and build outputs are unaffected — their launch path *is* their image path.
+
+### The log
+`%APPDATA%\vscode_panel\panel.log` records panel startup (with PID and whether it is elevated), every finish that queues a restart, and then each round of the sweep: every candidate process, *why* it matched, how many windows it was asked to close, and whether terminating it succeeded. A process that cannot be opened is called out explicitly, with the likely reason — an elevated app cannot be managed by a panel that is not. It rolls to `panel.log.1` past `LOG_MAX_BYTES`, and every logging failure is swallowed: logging must never break the panel.
 
 ### Notifications
 The light alone is passive — you still have to look at the panel. So `update_lights()` also watches for *transitions*: when a project's state changes into one of `NOTIFY_ON` (default `done` and `waiting`), `alert()` fires four ways, each independently switchable:

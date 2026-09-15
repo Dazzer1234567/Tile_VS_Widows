@@ -51,6 +51,7 @@ STATUS_DIR = os.path.join(tempfile.gettempdir(), "vscode_panel_status")   # writ
 # these are meant to outlive a reboot or a temp sweep.
 PREFS_PATH = os.path.join(os.environ.get("APPDATA") or tempfile.gettempdir(),
                           "vscode_panel", "prefs.json")
+LOG_PATH = os.path.join(os.path.dirname(PREFS_PATH), "panel.log")
 SOUND_ON, SOUND_OFF = "🔊", "🔇"     # speaker / muted speaker
 SOUND_ON_BG, SOUND_OFF_BG = "#1f6feb", "#e5484d"      # blue when sounding, red when muted
 SOUND_FONT = ("Segoe UI Emoji", 14)
@@ -63,6 +64,8 @@ SPEAK_VOICE = ""                         # "" = Windows default; e.g. "Microsoft
 SPEAK_RATE = 0                           # SAPI rate, -10 (slow) to 10 (fast)
 SAY_WIDTH = 14                           # minimum width of the spoken-text box, in characters
 RESTART_GRACE_MS = 1500                  # how long an app gets to close itself before being killed
+RESTART_DELAY_MS = 10000                 # settle time after a conversation stops, before restarting
+LOG_MAX_BYTES = 1000000                  # panel.log is rolled to panel.log.1 past this
 BAD_PATH_BG = "#ffd7d5"                  # restart box tint when the path does not exist
 SAY_SAVE_MS = 800                        # idle time after typing before the phrase is saved
 EAR = "👂"                        # preview button
@@ -373,6 +376,22 @@ def read_statuses():
     return out
 
 
+LOG_LOCK = threading.Lock()
+
+
+def log(msg):
+    """Append a line to panel.log.  Never raises - logging must not break the panel."""
+    try:
+        with LOG_LOCK:
+            os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+            if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
+                os.replace(LOG_PATH, LOG_PATH + ".1")
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write("%s  %s\n" % (time.strftime("%H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
 def read_prefs():
     """(muted projects, {project: phrase spoken when it finishes}, volume 0-100)"""
     try:
@@ -418,19 +437,38 @@ def process_path(pid):
 
 
 ALIAS_IMAGE = {}                # configured path -> what it really runs as, learned on launch
+LAUNCHED = {}                   # configured path -> PIDs we started, so we can always find them
 
 
-def pids_of(path):
-    """PIDs whose executable is exactly `path`.  Matched on the full path rather than
-    the file name, so another copy of the same-named exe elsewhere is never touched -
-    matching by name would make a target like python.exe catastrophic.
+def stale_image(full, base):
+    """True when a process named `base` is running from an image that is no longer the
+    file it was started from - it has been deleted, renamed, or moved to the Recycle Bin.
 
-    Also matches the image a Windows execution alias resolves to, once we have seen it:
-    launching the notepad.exe in System32 really runs Notepad from WindowsApps,
-    and a strict path comparison would never recognise its own instances."""
+    That is what a rebuild does: replacing the exe while it runs leaves the process with
+    an image path under $Recycle.Bin with a mangled name.  Strict path matching then
+    stops recognising it, so the old build is never closed and a second instance is
+    launched beside it - every rebuild, forever.  It stays safe because a genuinely
+    different program of the same name has an image that still exists where it is."""
+    if full is None:
+        return True                         # cannot be inspected at all
+    if os.path.normcase(os.path.basename(full)) != base:
+        return True                         # renamed out from under the process
+    try:
+        return not os.path.isfile(full)
+    except OSError:
+        return True
+
+
+def scan_for(path):
+    """[(pid, image, why)] for every running instance of `path`.
+
+    Matched on the full image path rather than the file name: matching a target like
+    python.exe by name would kill unrelated processes machine-wide.  Also matched are
+    the image a Windows execution alias resolved to, and same-named processes whose own
+    image has gone (see stale_image)."""
     target = os.path.normcase(os.path.abspath(path))
     wanted = {target, ALIAS_IMAGE.get(target)} - {None}
-    base = os.path.basename(target)
+    base = os.path.normcase(os.path.basename(target))
     me, found = os.getpid(), []
     snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if not snap or snap == wt.HANDLE(-1).value:
@@ -445,11 +483,19 @@ def pids_of(path):
             if pid != me and os.path.normcase(entry.szExeFile) == base:
                 full = process_path(pid)
                 if full and os.path.normcase(full) in wanted:
-                    found.append(pid)
+                    found.append((pid, full, "path"))
+                elif pid in LAUNCHED.get(target, ()):
+                    found.append((pid, full, "we launched it"))
+                elif stale_image(full, base):
+                    found.append((pid, full, "image gone - rebuilt?"))
             ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
     finally:
         kernel32.CloseHandle(snap)
     return found
+
+
+def pids_of(path):
+    return [pid for pid, _image, _why in scan_for(path)]
 
 
 def windows_of(pid):
@@ -474,58 +520,83 @@ def close_app(path, rounds=3):
     a launcher can start the real process a moment later, and an instance still opening
     when the first sweep ran would be missed entirely."""
     closed = 0
-    for _ in range(rounds):
-        pids = pids_of(path)
-        if not pids:
+    for round_no in range(1, rounds + 1):
+        found = scan_for(path)
+        if not found:
+            log("   round %d: nothing running" % round_no)
             break
-        closed = max(closed, len(pids))
-        for pid in pids:
-            for hwnd in windows_of(pid):
+        closed = max(closed, len(found))
+        for pid, image, why in found:
+            log("   round %d: pid %-7s matched by %-20s image=%s"
+                % (round_no, pid, why, image))
+        for pid, _image, _why in found:
+            wins = windows_of(pid)
+            for hwnd in wins:
                 user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)   # let it shut down tidily
+            log("      pid %-7s sent WM_CLOSE to %d window(s)" % (pid, len(wins)))
         deadline = time.time() + RESTART_GRACE_MS / 1000    # no longer than it needs
         while time.time() < deadline and pids_of(path):
             time.sleep(0.1)
         for pid in pids_of(path):                           # whatever is still standing
             h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
             if h:
-                kernel32.TerminateProcess(h, 0)
+                ok = kernel32.TerminateProcess(h, 0)
                 kernel32.CloseHandle(h)
+                log("      pid %-7s terminated (ok=%s)" % (pid, bool(ok)))
+            else:
+                log("      pid %-7s COULD NOT OPEN to terminate - error %d%s"
+                    % (pid, ctypes.get_last_error(),
+                       "; it is probably elevated, so the panel would have to be too"))
         time.sleep(0.25)                                    # let the kernel reap them
     return closed
 
 
 def launch_app(path):
-    """Start it, then note what it actually runs as, so the next restart recognises it
-    even when the path given is an execution alias pointing somewhere else."""
+    """Start it, remembering the PID - so a later rebuild that moves the exe out from
+    under it cannot stop us recognising our own instance - and note what it actually
+    runs as, for when the path given is an execution alias pointing elsewhere."""
     proc = subprocess.Popen([path], cwd=os.path.dirname(path) or None, close_fds=True,
                             creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
     key = os.path.normcase(os.path.abspath(path))
+    LAUNCHED.setdefault(key, set()).add(proc.pid)
     for _ in range(20):
         image = process_path(proc.pid)
         if image:
             if os.path.normcase(image) != key:
                 ALIAS_IMAGE[key] = os.path.normcase(image)
+                log("      alias: runs as %s" % image)
+            log("      launched pid %d" % proc.pid)
             return
         time.sleep(0.1)
+    log("      launched pid %d (image not readable yet)" % proc.pid)
 
 
 RESTART_LOCK = threading.Lock()
 
 
-def restart_app(path):
+def restart_app(path, project=""):
     """Close every instance of `path`, then start it again.  Runs on a worker thread:
-    it sleeps through the grace period and must not block the UI.
+    it sleeps through the settle delay and grace period and must not block the UI.
 
     Serialised, because two finishes close together would otherwise interleave - one
     thread's sweep killing the instance the other had just launched."""
     if not os.path.isfile(path):
+        log("restart %s: SKIPPED, not a file: %s" % (project, path))
         return
+    time.sleep(RESTART_DELAY_MS / 1000)     # let the app settle before touching it
     with RESTART_LOCK:
+        log("restart %s: %s" % (project, path))
         try:
-            close_app(path)
+            closed = close_app(path)
             launch_app(path)
-        except Exception:
-            pass                    # a failed restart must not take the panel down
+            time.sleep(1.0)
+            after = scan_for(path)
+            log("   done: closed %d, now running %d -> %s"
+                % (closed, len(after), [pid for pid, _i, _w in after]))
+            if len(after) > 1:
+                log("   WARNING: more than one instance is running")
+        except Exception as exc:
+            log("   FAILED: %r" % (exc,))
 
 
 # ---- notifications ---------------------------------------------------------
@@ -747,6 +818,8 @@ class Panel(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<FocusIn>", lambda e: self.stop_flash())
 
+        log("--- panel started: pid %d, elevated=%s ---"
+            % (os.getpid(), bool(ctypes.windll.shell32.IsUserAnAdmin())))
         self.refresh()
 
     def panel_hwnd(self):
@@ -962,8 +1035,9 @@ class Panel(tk.Tk):
                 play_alert(state, self.volume)
         if state == "done":
             path = self.run.get(project, "").strip()
-            if path:                    # threaded: close_app sleeps out the grace period
-                threading.Thread(target=restart_app, args=(path,), daemon=True).start()
+            if path:                    # threaded: it sleeps out the settle delay
+                log("%s finished; restart queued in %.0fs" % (project, RESTART_DELAY_MS / 1000))
+                threading.Thread(target=restart_app, args=(path, project), daemon=True).start()
         if NOTIFY_TOAST:
             self._tray.notify("Claude Code",
                               "%s: %s" % (project, "finished" if state == "done" else "needs you"))
