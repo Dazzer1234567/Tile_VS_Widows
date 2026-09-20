@@ -54,12 +54,14 @@ PREFS_PATH = os.path.join(os.environ.get("APPDATA") or tempfile.gettempdir(),
 LOG_PATH = os.path.join(os.path.dirname(PREFS_PATH), "panel.log")
 SOUND_ON, SOUND_OFF = "🔊", "🔇"     # speaker / muted speaker
 SOUND_ON_BG, SOUND_OFF_BG = "#1f6feb", "#e5484d"      # blue when sounding, red when muted
-SOUND_FONT = ("Segoe UI Emoji", 6)       # speaker on a card
+SOUND_FONT = ("Segoe UI Emoji", 12)      # speaker on a card
 EAR_FONT = ("Segoe UI Emoji", 12)        # the preview button, which has room to be bigger
-FIELD_FONT = ("Segoe UI", 6)             # card text: Max button and both boxes
+FIELD_FONT = ("Segoe UI", 9)             # card text: Max button and both boxes.
+                                         # 9 is the Windows default - do not go below it,
+                                         # a shorter card is not worth unreadable text
 GRIP_SCALE = 1.6                         # drag bar height, as a multiple of its natural one
 RESTART_GLYPH = "\U0001F501"              # the restart toggle, beside the app path
-RESTART_FONT = ("Segoe UI Emoji", 5)     # smaller, so it sits level with the path box
+RESTART_FONT = ("Segoe UI Emoji", 9)     # smaller, so it sits level with the path box
 RESTART_ON_BG = "#f0862b"                # orange when the restart is armed
 CARET_DOWN, CARET_UP = "\u25be", "\u25b4"
 # (frequency Hz, milliseconds) per alert.  Rising = finished, falling = wants you.
@@ -941,7 +943,7 @@ class Panel(tk.Tk):
                                 font=FIELD_FONT, pady=0,
                                 command=lambda h=h, p=proj: self.focus_window(h, p))
                 btn.pack(side="left", fill="x", expand=True, padx=1)
-                say = tk.Entry(row, width=SAY_WIDTH, font=FIELD_FONT, bd=1)  # phrase, underneath
+                say = tk.Entry(row, width=SAY_WIDTH, font=FIELD_FONT)   # phrase, underneath
                 say.insert(0, self.say.get(proj, ""))
                 say.pack(fill="x", padx=1, pady=(1, 0))
                 self._bind_field("say", proj, say)
@@ -951,7 +953,7 @@ class Panel(tk.Tk):
                                  relief="flat", bd=1, padx=0, pady=0,
                                  command=lambda p=proj: self.toggle_restart(p))
                 rbtn.pack(side="left", padx=(1, 0))
-                run = tk.Entry(run_row, width=SAY_WIDTH, font=FIELD_FONT, bd=1)
+                run = tk.Entry(run_row, width=SAY_WIDTH, font=FIELD_FONT)
                 run.insert(0, self.run.get(proj, ""))
                 run.pack(side="left", fill="x", expand=True, padx=1)
                 self._bind_field("run", proj, run)
