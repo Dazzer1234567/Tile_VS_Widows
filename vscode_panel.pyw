@@ -806,25 +806,27 @@ class Panel(tk.Tk):
             b.pack(side="left", padx=2, fill="x", expand=True)
             self.buttons.append(b)
 
-        vol = tk.Frame(self)
-        vol.pack(fill="x", pady=(4, 0))
-        self.ear = tk.Button(vol, text=EAR, font=SOUND_FONT, width=2, command=self.preview)
+        # the caret rides with the three buttons, fixed width so they keep the rest
+        self.more_btn = tk.Button(top, text=CARET_DOWN, width=2, padx=0,
+                                  command=self.toggle_extras)
+        self.more_btn.pack(side="left", padx=(2, 0))
+        self.buttons.append(self.more_btn)
+
+        # everything the caret reveals: preview and volume, hidden until asked for
+        self.extras = tk.Frame(self)
+        self.ear = tk.Button(self.extras, text=EAR, font=SOUND_FONT, width=2,
+                             command=self.preview)
         self.ear.pack(side="left", padx=2)
         self.buttons.append(self.ear)
-        self.vol_btn = tk.Button(vol, command=self.toggle_volume)
-        self.vol_btn.pack(side="left", fill="x", expand=True, padx=2)
-        self.buttons.append(self.vol_btn)
-
-        # the slider lives in its own frame, packed only while the dropdown is open
-        self.vol_frame = tk.Frame(self)
-        self.vol_scale = tk.Scale(self.vol_frame, from_=0, to=100, orient="horizontal",
-                                  showvalue=True, command=self.volume_changed)
+        self.vol_scale = tk.Scale(self.extras, from_=0, to=100, orient="horizontal",
+                                  showvalue=True, label="Voice volume",
+                                  font=("Segoe UI", 7), command=self.volume_changed)
         self.vol_scale.set(self.volume)
-        self.vol_scale.pack(fill="x", padx=2)
+        self.vol_scale.pack(side="left", fill="x", expand=True, padx=2)
 
         self.progress = ttk.Progressbar(self, mode="determinate")
         self.progress.pack(fill="x", pady=(6, 0))
-        self.show_volume(self.vol_open)     # needs progress to exist, to pack before it
+        self.show_extras(self.vol_open)     # needs progress to exist, to pack before it
 
         self.list = tk.Frame(self)
         self.list.pack(fill="x", pady=(6, 0))
@@ -986,26 +988,24 @@ class Panel(tk.Tk):
                 run.configure(bg=BAD_PATH_BG if bad else "white")
                 rbtn.configure(bg=run_bg, activebackground=run_bg)
 
-    def show_volume(self, open_):
-        """The slider is wanted rarely, so it is hidden by default.  It packs before the
-        progress bar rather than at the end, which is where pack would otherwise put it."""
+    def show_extras(self, open_):
+        """Preview and volume are wanted rarely, so they stay collapsed behind the caret
+        and the panel stays compact.  They pack before the progress bar rather than at
+        the end, which is where pack would otherwise put them - below the project rows."""
         self.vol_open = open_
         if open_:
-            self.vol_frame.pack(fill="x", before=self.progress)
+            self.extras.pack(fill="x", pady=(4, 0), before=self.progress)
         else:
-            self.vol_frame.pack_forget()
-        self.vol_btn.configure(text="Volume %d %s"
-                               % (self.volume, CARET_UP if open_ else CARET_DOWN))
+            self.extras.pack_forget()
+        self.more_btn.configure(text=CARET_UP if open_ else CARET_DOWN)
 
-    def toggle_volume(self):
-        self.show_volume(not self.vol_open)
+    def toggle_extras(self):
+        self.show_extras(not self.vol_open)
         self.save()
 
     def volume_changed(self, value):
         """Fires on every pixel of the drag, so the real work is debounced."""
         self.volume = int(float(value))
-        self.vol_btn.configure(text="Volume %d %s"
-                               % (self.volume, CARET_UP if self.vol_open else CARET_DOWN))
         if self._vol_job:
             self.after_cancel(self._vol_job)
         self._vol_job = self.after(VOLUME_SAVE_MS, self.volume_settled)
