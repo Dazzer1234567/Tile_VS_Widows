@@ -54,9 +54,12 @@ PREFS_PATH = os.path.join(os.environ.get("APPDATA") or tempfile.gettempdir(),
 LOG_PATH = os.path.join(os.path.dirname(PREFS_PATH), "panel.log")
 SOUND_ON, SOUND_OFF = "🔊", "🔇"     # speaker / muted speaker
 SOUND_ON_BG, SOUND_OFF_BG = "#1f6feb", "#e5484d"      # blue when sounding, red when muted
-SOUND_FONT = ("Segoe UI Emoji", 14)
+SOUND_FONT = ("Segoe UI Emoji", 6)       # speaker on a card
+EAR_FONT = ("Segoe UI Emoji", 12)        # the preview button, which has room to be bigger
+FIELD_FONT = ("Segoe UI", 6)             # card text: Max button and both boxes
+GRIP_SCALE = 1.6                         # drag bar height, as a multiple of its natural one
 RESTART_GLYPH = "\U0001F501"              # the restart toggle, beside the app path
-RESTART_FONT = ("Segoe UI Emoji", 9)     # smaller, so it sits level with the path box
+RESTART_FONT = ("Segoe UI Emoji", 5)     # smaller, so it sits level with the path box
 RESTART_ON_BG = "#f0862b"                # orange when the restart is armed
 CARET_DOWN, CARET_UP = "\u25be", "\u25b4"
 # (frequency Hz, milliseconds) per alert.  Rising = finished, falling = wants you.
@@ -786,10 +789,10 @@ class Panel(tk.Tk):
         grip = tk.Label(self, text="\u270b", font=("Segoe UI Emoji", 12),
                         cursor="fleur", bg="#d9d9d9")
         grip.pack(fill="x", pady=(0, 6))
-        # twice the natural height, so it is an easy target to grab.  Derived from
-        # reqheight rather than a pixel constant so it still doubles at any DPI or font size.
+        # GRIP_SCALE times its natural height, so it stays an easy target.  Derived from
+        # reqheight rather than a pixel constant so it scales at any DPI or font size.
         self.update_idletasks()
-        grip.pack_configure(ipady=grip.winfo_reqheight() // 2)
+        grip.pack_configure(ipady=int(grip.winfo_reqheight() * (GRIP_SCALE - 1) / 2))
         grip.bind("<ButtonPress-1>", self._drag_start)
         grip.bind("<B1-Motion>", self._drag_move)
         grip.bind("<Button-3>", lambda e: self.close())
@@ -814,7 +817,7 @@ class Panel(tk.Tk):
 
         # everything the caret reveals: preview and volume, hidden until asked for
         self.extras = tk.Frame(self)
-        self.ear = tk.Button(self.extras, text=EAR, font=SOUND_FONT, width=2,
+        self.ear = tk.Button(self.extras, text=EAR, font=EAR_FONT, width=2,
                              command=self.preview)
         self.ear.pack(side="left", padx=2)
         self.buttons.append(self.ear)
@@ -824,12 +827,13 @@ class Panel(tk.Tk):
         self.vol_scale.set(self.volume)
         self.vol_scale.pack(side="left", fill="x", expand=True, padx=2)
 
+        # not packed: it is only meaningful during a tile, and sitting there the rest of
+        # the time put an empty bar and its padding between the buttons and the first card
         self.progress = ttk.Progressbar(self, mode="determinate")
-        self.progress.pack(fill="x", pady=(6, 0))
-        self.show_extras(self.vol_open)     # needs progress to exist, to pack before it
 
         self.list = tk.Frame(self)
-        self.list.pack(fill="x", pady=(6, 0))
+        self.list.pack(fill="x")
+        self.show_extras(self.vol_open)     # needs list to exist, to pack before it
         self._sig = None
         self._busy = False
 
@@ -872,6 +876,7 @@ class Panel(tk.Tk):
         if not wins or not SCROLL_TO_BOTTOM:
             return
         self._busy = True
+        self.progress.pack(fill="x", pady=(4, 0), before=self.list)
         self._set_buttons("disabled")
         self._saved = POINT()
         user32.GetCursorPos(ctypes.byref(self._saved))
@@ -888,6 +893,7 @@ class Panel(tk.Tk):
         except StopIteration:
             user32.SetCursorPos(self._saved.x, self._saved.y)
             self.progress.configure(value=0)
+            self.progress.pack_forget()
             self._set_buttons("normal")
             self._busy = False
 
@@ -928,24 +934,26 @@ class Panel(tk.Tk):
                 head = tk.Frame(row)            # speaker + Max button
                 head.pack(fill="x")
                 mute = tk.Button(head, font=SOUND_FONT, width=2, relief="flat", bd=1,
+                                 padx=0, pady=0,
                                  command=lambda p=proj: self.toggle_sound(p))
-                mute.pack(side="left", padx=(1, 0), pady=1)
+                mute.pack(side="left", padx=(1, 0))
                 btn = tk.Button(head, text=f"Max: {name}", anchor="w", relief="flat", bd=1,
+                                font=FIELD_FONT, pady=0,
                                 command=lambda h=h, p=proj: self.focus_window(h, p))
-                btn.pack(side="left", fill="x", expand=True, padx=1, pady=1)
-                say = tk.Entry(row, width=SAY_WIDTH)    # the phrase, underneath
+                btn.pack(side="left", fill="x", expand=True, padx=1)
+                say = tk.Entry(row, width=SAY_WIDTH, font=FIELD_FONT, bd=1)  # phrase, underneath
                 say.insert(0, self.say.get(proj, ""))
-                say.pack(fill="x", padx=1, pady=(0, 2))
+                say.pack(fill="x", padx=1, pady=(1, 0))
                 self._bind_field("say", proj, say)
                 run_row = tk.Frame(row)                 # toggle + app to restart
-                run_row.pack(fill="x")
+                run_row.pack(fill="x", pady=(1, 1))
                 rbtn = tk.Button(run_row, text=RESTART_GLYPH, font=RESTART_FONT, width=2,
                                  relief="flat", bd=1, padx=0, pady=0,
                                  command=lambda p=proj: self.toggle_restart(p))
-                rbtn.pack(side="left", padx=(1, 0), pady=(0, 2))
-                run = tk.Entry(run_row, width=SAY_WIDTH)
+                rbtn.pack(side="left", padx=(1, 0))
+                run = tk.Entry(run_row, width=SAY_WIDTH, font=FIELD_FONT, bd=1)
                 run.insert(0, self.run.get(proj, ""))
-                run.pack(side="left", fill="x", expand=True, padx=1, pady=(0, 2))
+                run.pack(side="left", fill="x", expand=True, padx=1)
                 self._bind_field("run", proj, run)
                 # a list: two windows can share a folder name, and the hook writes one
                 # status file per name, so both rows must show that same state
@@ -994,7 +1002,7 @@ class Panel(tk.Tk):
         the end, which is where pack would otherwise put them - below the project rows."""
         self.vol_open = open_
         if open_:
-            self.extras.pack(fill="x", pady=(4, 0), before=self.progress)
+            self.extras.pack(fill="x", pady=(4, 0), before=self.list)
         else:
             self.extras.pack_forget()
         self.more_btn.configure(text=CARET_UP if open_ else CARET_DOWN)

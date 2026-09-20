@@ -134,7 +134,9 @@ Restart the VS Code windows after editing settings so the extension picks the ho
 - Icon: a 2×2 black-squares `.ico` is embedded as base64 and written to `%TEMP%` on first run. `SetCurrentProcessExplicitAppUserModelID` is called so the taskbar shows it instead of the Python icon.
 - The spoken-text box is a plain `Entry` and deliberately keeps its normal background rather than the row's status tint, which would hurt readability of the text.
 - Both text boxes share one implementation (`_bind_field` / `field_typed` / `field_done` / `field_store`), keyed by which dict they write to, so the debounced-save behaviour cannot drift between them.
-- Drag bar: the `✋` row at the top moves the panel. It is padded to twice its natural height to be an easy target; the padding is derived from the label's `reqheight` rather than a pixel constant, so it still doubles at any DPI or font size. `SHOW_TITLEBAR = False` makes it frameless (right-click the hand to quit).
+- Drag bar: the `✋` row at the top moves the panel. `GRIP_SCALE` sets its height as a multiple of its natural one, derived from the label's `reqheight` rather than a pixel constant so it holds at any DPI or font size.
+- The progress bar is **packed only while tiling**. Left packed, an empty bar and its padding sat permanently between the buttons and the first card. It packs `before=self.list` so it appears above the cards rather than below them, which is where `pack` would put it, and that survives the row rebuilds `refresh()` does.
+- Card metrics are driven by `FIELD_FONT`, `SOUND_FONT` and `RESTART_FONT`. The `head` row's height follows whichever of the Max button and the speaker is taller, so shrinking only the speaker does nothing — the Max button carries `FIELD_FONT` for that reason. `SHOW_TITLEBAR = False` makes it frameless (right-click the hand to quit).
 
 ## Config knobs (top of `vscode_panel.py`)
 `TITLE_SUFFIX`, `MONITOR`, `REFRESH_MS`, `SCROLL_TO_BOTTOM`, `SCROLL_POINTS`, `SCROLL_NOTCHES`, `SCROLL_STEP_MS`, `SETTLE_MS`, `SHOW_TITLEBAR`, `STATUS_COLORS`, `NOTIFY_ON`, `NOTIFY_SOUND`, `NOTIFY_TOAST`, `NOTIFY_FLASH_TASKBAR`.
