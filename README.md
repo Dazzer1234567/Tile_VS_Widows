@@ -47,10 +47,10 @@ Each row carries a speaker button — **blue 🔊 when the sound is on, red 🔇
 
 The speaker keeps its own blue/red background rather than taking the row's status tint, so on/off stays readable whatever the row is doing. Its colour has to be set on the *background*: `Segoe UI Emoji` is a colour font, so `fg` would not repaint the glyph. Size comes from `SOUND_FONT`; at 14pt it makes the row 65px tall against 44px with the original 9pt.
 
-The muted set cannot live on the widgets, because `refresh()` destroys and rebuilds every row whenever a window opens or closes. It lives in `Panel.muted` and is written to `%APPDATA%\vscode_panel\prefs.json` on each click — deliberately *not* alongside the status files in `%TEMP%`, which are disposable, while a preference should outlive a reboot or a temp sweep. A failed read or write is swallowed: a preference is not worth crashing the panel over.
+Preferences are read and written as a **single dict** (`read_prefs` / `write_prefs`, assembled by `Panel.save()`), not as a positional tuple. Each new setting was otherwise changing the function signature and all five call sites. The muted set cannot live on the widgets, because `refresh()` destroys and rebuilds every row whenever a window opens or closes. It lives in `Panel.muted` and is written to `%APPDATA%\vscode_panel\prefs.json` on each click — deliberately *not* alongside the status files in `%TEMP%`, which are disposable, while a preference should outlive a reboot or a temp sweep. A failed read or write is swallowed: a preference is not worth crashing the panel over.
 
 ### Volume and preview
-Under the three buttons sit a **voice volume** slider and an **ear** button. The ear speaks the name of the top project in the list, so you can set the level by ear without waiting for a conversation to finish.
+Under the three buttons sit an **ear** button and a **Volume** button. The slider itself is a dropdown — it is wanted rarely, so it stays collapsed and the button carries the current level (`Volume 74 ▾`). Opening it packs the slider *before* the progress bar rather than at the end, which is where `pack` would otherwise put it; open or closed is remembered in `vol_open`. The ear speaks the name of the top project in the list, so you can set the level by ear without waiting for a conversation to finish.
 
 `PlaySound` has no volume control, so the level has to be baked in at synthesis: `$s.Volume` for speech, and the sample amplitude for the tones. Both caches are therefore keyed by *(content, volume)* rather than content alone, which keeps playback a plain `PlaySound` on a cached file instead of rewriting a WAV on every play. Tone amplitude is `SOUND_PEAK * volume / 100`, so the default 60 reproduces the old fixed 0.35 of full scale and there is headroom above it.
 
@@ -68,7 +68,7 @@ A related fix was needed to make the box usable at all: `refresh()` rebuilt ever
 ### Restart an app when a project finishes
 Under the spoken-phrase box is a second box: put the **full path to an executable** in it and, when that project turns green, every instance of it is closed and one is started again. Useful for a test build you want relaunched on each pass. The box turns pink while the path does not point at a file, so a typo says so instead of silently doing nothing. Quotes are stripped, so Explorer's *Copy as path* can be pasted straight in.
 
-Beside that box is a 🔁 toggle, **blue on / red off**, matching the speaker convention. Switching it off suspends the close-and-reopen for that project while leaving the path in place, so it is still there when you want it back; the setting persists in `run_off`.
+Beside that box is a 🔁 toggle, **orange on / red off** — orange rather than the speaker's blue, so the two are not mistaken for each other at a glance. Switching it off suspends the close-and-reopen for that project while leaving the path in place, so it is still there when you want it back; the setting persists in `run_off`.
 
 The restart waits `RESTART_DELAY_MS` (4s) after the conversation stops before touching anything, so the app is not closed while it is still settling.
 

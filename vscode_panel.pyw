@@ -57,6 +57,8 @@ SOUND_ON_BG, SOUND_OFF_BG = "#1f6feb", "#e5484d"      # blue when sounding, red 
 SOUND_FONT = ("Segoe UI Emoji", 14)
 RESTART_GLYPH = "\U0001F501"              # the restart toggle, beside the app path
 RESTART_FONT = ("Segoe UI Emoji", 9)     # smaller, so it sits level with the path box
+RESTART_ON_BG = "#f0862b"                # orange when the restart is armed
+CARET_DOWN, CARET_UP = "\u25be", "\u25b4"
 # (frequency Hz, milliseconds) per alert.  Rising = finished, falling = wants you.
 SOUND_TONES = {"done": [(660, 90), (880, 150)], "waiting": [(760, 90), (570, 170)]}
 SOUND_PEAK = 0.6                         # tone amplitude at slider 100, of full scale
@@ -395,24 +397,31 @@ def log(msg):
 
 
 def read_prefs():
-    """(muted projects, {project: phrase spoken when it finishes}, volume 0-100)"""
+    """Everything the panel remembers between runs, as one dict.  A dict rather than a
+    tuple because every new setting was changing the signature and all five call sites."""
+    d = {"muted": set(), "say": {}, "run": {}, "run_off": set(),
+         "volume": VOLUME_DEFAULT, "vol_open": False}
     try:
         with open(PREFS_PATH) as f:
-            d = json.load(f)
-        vol = int(d.get("volume", VOLUME_DEFAULT))
-        return (set(d.get("muted", [])), dict(d.get("say", {})),
-                dict(d.get("run", {})), set(d.get("run_off", [])),
-                max(0, min(100, vol)))
+            raw = json.load(f)
+        d["muted"] = set(raw.get("muted", []))
+        d["say"] = dict(raw.get("say", {}))
+        d["run"] = dict(raw.get("run", {}))
+        d["run_off"] = set(raw.get("run_off", []))
+        d["volume"] = max(0, min(100, int(raw.get("volume", VOLUME_DEFAULT))))
+        d["vol_open"] = bool(raw.get("vol_open", False))
     except Exception:
-        return set(), {}, {}, set(), VOLUME_DEFAULT
+        pass                        # first run, or an unreadable file: use the defaults
+    return d
 
 
-def write_prefs(muted, say, run, run_off, volume):
+def write_prefs(d):
     try:
         os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
         with open(PREFS_PATH, "w") as f:
-            json.dump({"muted": sorted(muted), "say": say, "run": run,
-                       "run_off": sorted(run_off), "volume": volume}, f)
+            json.dump({"muted": sorted(d["muted"]), "say": d["say"], "run": d["run"],
+                       "run_off": sorted(d["run_off"]), "volume": d["volume"],
+                       "vol_open": d["vol_open"]}, f)
     except Exception:
         pass                        # a preference is not worth crashing the panel over
 
@@ -760,7 +769,10 @@ class Panel(tk.Tk):
         except Exception:
             pass
         # prefs first: the volume slider below is built from them
-        self.muted, self.say, self.run, self.run_off, self.volume = read_prefs()
+        prefs = read_prefs()
+        self.muted, self.say, self.run = prefs["muted"], prefs["say"], prefs["run"]
+        self.run_off, self.volume = prefs["run_off"], prefs["volume"]
+        self.vol_open = prefs["vol_open"]
         self._vol_job = None                # pending debounced save of the volume
         self._jobs = {}                     # pending debounced saves, per text field
 
@@ -799,14 +811,20 @@ class Panel(tk.Tk):
         self.ear = tk.Button(vol, text=EAR, font=SOUND_FONT, width=2, command=self.preview)
         self.ear.pack(side="left", padx=2)
         self.buttons.append(self.ear)
-        self.vol_scale = tk.Scale(vol, from_=0, to=100, orient="horizontal", showvalue=True,
-                                  label="Voice volume", font=("Segoe UI", 7),
-                                  command=self.volume_changed)
+        self.vol_btn = tk.Button(vol, command=self.toggle_volume)
+        self.vol_btn.pack(side="left", fill="x", expand=True, padx=2)
+        self.buttons.append(self.vol_btn)
+
+        # the slider lives in its own frame, packed only while the dropdown is open
+        self.vol_frame = tk.Frame(self)
+        self.vol_scale = tk.Scale(self.vol_frame, from_=0, to=100, orient="horizontal",
+                                  showvalue=True, command=self.volume_changed)
         self.vol_scale.set(self.volume)
-        self.vol_scale.pack(side="left", fill="x", expand=True, padx=2)
+        self.vol_scale.pack(fill="x", padx=2)
 
         self.progress = ttk.Progressbar(self, mode="determinate")
         self.progress.pack(fill="x", pady=(6, 0))
+        self.show_volume(self.vol_open)     # needs progress to exist, to pack before it
 
         self.list = tk.Frame(self)
         self.list.pack(fill="x", pady=(6, 0))
@@ -826,6 +844,12 @@ class Panel(tk.Tk):
             % (os.getpid(), bool(ctypes.windll.shell32.IsUserAnAdmin())))
         self.refresh()
 
+    def save(self):
+        """Write every remembered setting.  One place, so a new one needs no new callers."""
+        write_prefs({"muted": self.muted, "say": self.say, "run": self.run,
+                     "run_off": self.run_off, "volume": self.volume,
+                     "vol_open": self.vol_open})
+
     def panel_hwnd(self):
         self.update_idletasks()
         try:
@@ -834,7 +858,7 @@ class Panel(tk.Tk):
             return user32.GetParent(self.winfo_id()) or self.winfo_id()
 
     def close(self):
-        write_prefs(self.muted, self.say, self.run, self.run_off, self.volume)   # flush mid-debounce
+        self.save()                             # flush anything mid-debounce
         self._tray.remove()
         self.destroy()
 
@@ -953,7 +977,7 @@ class Panel(tk.Tk):
             sound_bg = SOUND_OFF_BG if muted else SOUND_ON_BG
             path = self.run.get(proj, "").strip()
             bad = bool(path) and not os.path.isfile(path)   # say so, rather than silently no-op
-            run_bg = SOUND_OFF_BG if proj in self.run_off else SOUND_ON_BG
+            run_bg = SOUND_OFF_BG if proj in self.run_off else RESTART_ON_BG
             for row, head, btn, mute, _say, run, rbtn in widgets:
                 row.configure(bg=colour)
                 head.configure(bg=colour)
@@ -962,9 +986,26 @@ class Panel(tk.Tk):
                 run.configure(bg=BAD_PATH_BG if bad else "white")
                 rbtn.configure(bg=run_bg, activebackground=run_bg)
 
+    def show_volume(self, open_):
+        """The slider is wanted rarely, so it is hidden by default.  It packs before the
+        progress bar rather than at the end, which is where pack would otherwise put it."""
+        self.vol_open = open_
+        if open_:
+            self.vol_frame.pack(fill="x", before=self.progress)
+        else:
+            self.vol_frame.pack_forget()
+        self.vol_btn.configure(text="Volume %d %s"
+                               % (self.volume, CARET_UP if open_ else CARET_DOWN))
+
+    def toggle_volume(self):
+        self.show_volume(not self.vol_open)
+        self.save()
+
     def volume_changed(self, value):
         """Fires on every pixel of the drag, so the real work is debounced."""
         self.volume = int(float(value))
+        self.vol_btn.configure(text="Volume %d %s"
+                               % (self.volume, CARET_UP if self.vol_open else CARET_DOWN))
         if self._vol_job:
             self.after_cancel(self._vol_job)
         self._vol_job = self.after(VOLUME_SAVE_MS, self.volume_settled)
@@ -973,7 +1014,7 @@ class Panel(tk.Tk):
         """Save, and re-render every phrase at the new level in the background - so the
         next alert speaks straight away instead of falling back to a beep once."""
         self._vol_job = None
-        write_prefs(self.muted, self.say, self.run, self.run_off, self.volume)
+        self.save()
         for text in set(self.say.values()):
             text = text.strip()
             if text and not os.path.exists(say_wav(text, self.volume)):
@@ -1028,7 +1069,7 @@ class Panel(tk.Tk):
             store[project] = text
         else:
             store.pop(project, None)
-        write_prefs(self.muted, self.say, self.run, self.run_off, self.volume)
+        self.save()
         if which == "say" and text and not os.path.exists(say_wav(text, self.volume)):
             threading.Thread(target=render_speech, args=(text, self.volume), daemon=True).start()
 
@@ -1038,13 +1079,13 @@ class Panel(tk.Tk):
         self.run_off.symmetric_difference_update({project})
         log("%s: restart-on-finish %s"
             % (project, "OFF" if project in self.run_off else "on"))
-        write_prefs(self.muted, self.say, self.run, self.run_off, self.volume)
+        self.save()
         self.update_lights()
 
     def toggle_sound(self, project):
         """Switch this project's green/red sound on or off, and remember it."""
         self.muted.symmetric_difference_update({project})
-        write_prefs(self.muted, self.say, self.run, self.run_off, self.volume)
+        self.save()
         self.update_lights()
 
     def alert(self, project, state):
