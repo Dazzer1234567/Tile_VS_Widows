@@ -68,7 +68,7 @@ A related fix was needed to make the box usable at all: `refresh()` rebuilt ever
 ### Restart an app when a project finishes
 Under the spoken-phrase box is a second box: put the **full path to an executable** in it and, when that project turns green, every instance of it is closed and one is started again. Useful for a test build you want relaunched on each pass. The box turns pink while the path does not point at a file, so a typo says so instead of silently doing nothing. Quotes are stripped, so Explorer's *Copy as path* can be pasted straight in.
 
-Beside that box is a 🔁 toggle, **orange on / red off** — orange rather than the speaker's blue, so the two are not mistaken for each other at a glance. Switching it off suspends the close-and-reopen for that project while leaving the path in place, so it is still there when you want it back; the setting persists in `run_off`.
+Beside that box is a 🔁 toggle, **orange on / grey off** — orange rather than the speaker's blue, so the two are not mistaken for each other at a glance. Off is grey rather than red: nothing is wrong when the restart is switched off, it is simply idle, and red here would read as a fault. Switching it off suspends the close-and-reopen for that project while leaving the path in place, so it is still there when you want it back; the setting persists in `run_off`.
 
 The restart waits `RESTART_DELAY_MS` (4s) after the conversation stops before touching anything, so the app is not closed while it is still settling.
 

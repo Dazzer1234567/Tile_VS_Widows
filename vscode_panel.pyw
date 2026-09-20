@@ -63,6 +63,7 @@ GRIP_SCALE = 1.6                         # drag bar height, as a multiple of its
 RESTART_GLYPH = "\U0001F501"              # the restart toggle, beside the app path
 RESTART_FONT = ("Segoe UI Emoji", 9)     # smaller, so it sits level with the path box
 RESTART_ON_BG = "#f0862b"                # orange when the restart is armed
+RESTART_OFF_BG = "#b0b0b0"               # grey when it is off - nothing is wrong, it is idle
 CARET_DOWN, CARET_UP = "\u25be", "\u25b4"
 # (frequency Hz, milliseconds) per alert.  Rising = finished, falling = wants you.
 SOUND_TONES = {"done": [(660, 90), (880, 150)], "waiting": [(760, 90), (570, 170)]}
@@ -989,7 +990,7 @@ class Panel(tk.Tk):
             sound_bg = SOUND_OFF_BG if muted else SOUND_ON_BG
             path = self.run.get(proj, "").strip()
             bad = bool(path) and not os.path.isfile(path)   # say so, rather than silently no-op
-            run_bg = SOUND_OFF_BG if proj in self.run_off else RESTART_ON_BG
+            run_bg = RESTART_OFF_BG if proj in self.run_off else RESTART_ON_BG
             for row, head, btn, mute, _say, run, rbtn in widgets:
                 row.configure(bg=colour)
                 head.configure(bg=colour)
