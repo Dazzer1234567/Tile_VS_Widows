@@ -503,6 +503,24 @@ def clear_status(label, states=None):
 
 
 # ---- status from other machines --------------------------------------------
+PANEL = None                    # the running Panel, so the web view can read its phrases
+ACK_QUEUE = []                  # labels the web view asked to clear, drained on the UI thread
+
+
+def web_cards():
+    """What the page renders.  Window actions and the app restart are deliberately not
+    exposed: raising a window on this machine is meaningless from a browser elsewhere,
+    and restarting an app from a phone is a good way to kill something by accident."""
+    now = time.time()
+    cards = []
+    for label, r in sorted(read_statuses().items()):
+        cards.append({"label": label, "project": r["project"], "host": r["host"],
+                      "state": r["state"], "remote": r["remote"],
+                      "age": max(0, int(now - r["time"])),
+                      "phrase": (PANEL.say.get(label, "") if PANEL else "")})
+    return {"host": THIS_HOST, "cards": cards}
+
+
 def tailscale_ip():
     """This machine's Tailscale address, if it has one.  Binding to that rather than to
     every interface keeps the listener off the LAN and off anything public."""
@@ -517,13 +535,104 @@ def tailscale_ip():
     return ""
 
 
+WEB_PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Claude sessions</title>
+<style>
+ :root { --bg:#f4f4f5; --fg:#18181b; --card:#ffffff; --line:#d4d4d8; --dim:#71717a; }
+ @media (prefers-color-scheme: dark) {
+   :root { --bg:#18181b; --fg:#f4f4f5; --card:#27272a; --line:#3f3f46; --dim:#a1a1aa; }
+ }
+ * { box-sizing:border-box; }
+ body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
+        font:15px/1.4 "Segoe UI",system-ui,sans-serif; }
+ h1 { font-size:17px; margin:0 0 4px; font-weight:600; }
+ .sub { color:var(--dim); font-size:12px; margin:0 0 16px; }
+ .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
+         padding:10px 12px; margin-bottom:8px; cursor:pointer; -webkit-tap-highlight-color:transparent; }
+ .card:active { transform:scale(.995); }
+ .working { background:#f0b429; color:#18181b; border-color:#d9a21f; }
+ .done    { background:#3ad35a; color:#18181b; border-color:#2fb84c; }
+ .waiting { background:#ff5a4d; color:#18181b; border-color:#e5484d; }
+ .name { font-weight:600; }
+ .meta { font-size:12px; opacity:.8; margin-top:2px; }
+ .empty { color:var(--dim); font-style:italic; }
+ .tag { font-size:11px; border:1px solid currentColor; border-radius:4px;
+        padding:0 4px; margin-left:6px; opacity:.75; }
+</style></head><body>
+<h1>Claude sessions</h1>
+<p class="sub" id="sub">connecting...</p>
+<div id="cards"></div>
+<script>
+const AGO = s => s < 60 ? s + "s ago" : s < 3600 ? Math.floor(s/60) + "m ago"
+                 : Math.floor(s/3600) + "h ago";
+async function ack(label) {
+  await fetch("api/ack", {method:"POST", headers:{"Content-Type":"application/json"},
+                          body: JSON.stringify({label})});
+  tick();
+}
+async function tick() {
+  let d;
+  try { d = await (await fetch("api/cards", {cache:"no-store"})).json(); }
+  catch (e) { document.getElementById("sub").textContent = "panel unreachable"; return; }
+  document.getElementById("sub").textContent =
+    "on " + d.host + " \\u00b7 " + d.cards.length + " session" +
+    (d.cards.length === 1 ? "" : "s") + " \\u00b7 tap a card to clear it";
+  const box = document.getElementById("cards");
+  if (!d.cards.length) { box.innerHTML = '<p class="empty">nothing reporting</p>'; return; }
+  box.innerHTML = d.cards.map(c =>
+    '<div class="card ' + c.state + '" onclick="ack(' + JSON.stringify(c.label).replace(/"/g,"&quot;") + ')">' +
+      '<div class="name">' + esc(c.project) +
+        (c.remote ? '<span class="tag">' + esc(c.host) + '</span>' : '') + '</div>' +
+      '<div class="meta">' + c.state + " \\u00b7 " + AGO(c.age) +
+        (c.phrase ? " \\u00b7 \\u201c" + esc(c.phrase) + "\\u201d" : "") + '</div>' +
+    '</div>').join("");
+}
+function esc(t) { const d = document.createElement("div"); d.textContent = t; return d.innerHTML; }
+tick(); setInterval(tick, 2000);
+</script></body></html>
+"""
+
+
 class StatusHandler(http.server.BaseHTTPRequestHandler):
     """Accepts one POST per hook event from a panel-less machine."""
 
+    def _send(self, code, ctype, body=b""):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        route = self.path.split("?")[0].rstrip("/") or "/"
+        if route in ("/", "/index.html"):
+            self._send(200, "text/html; charset=utf-8", WEB_PAGE.encode("utf-8"))
+        elif route == "/api/cards":
+            self._send(200, "application/json",
+                       json.dumps(web_cards()).encode("utf-8"))
+        else:
+            self._send(404, "text/plain; charset=utf-8", b"not found")
+
     def do_POST(self):
+        route = self.path.split("?")[0].rstrip("/") or "/"
         try:
             length = int(self.headers.get("Content-Length") or 0)
-            record = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+            if route == "/api/ack":
+                label = body.get("label", "")
+                if label:
+                    # queued rather than acted on here: this runs on an HTTP thread and
+                    # acknowledging touches Tk widgets, which only the UI thread may do
+                    ACK_QUEUE.append(label)
+                    log("web view cleared %s" % label)
+                self._send(204, "text/plain")
+                return
+            record = body
             if not record.get("project") or not record.get("state"):
                 raise ValueError("missing project or state")
             record.setdefault("host", self.client_address[0])
@@ -531,11 +640,10 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
             save_status(record)
             log("received from %s: %s = %s"
                 % (record["host"], record["project"], record["state"]))
-            self.send_response(204)
+            self._send(204, "text/plain")
         except Exception as exc:
             log("rejected a POST from %s: %r" % (self.client_address[0], exc))
-            self.send_response(400)
-        self.end_headers()
+            self._send(400, "text/plain; charset=utf-8", b"bad request")
 
     def log_message(self, *args):
         pass                        # the panel has its own log; keep http.server quiet
@@ -1025,6 +1133,8 @@ class Panel(tk.Tk):
 
         log("--- panel started: pid %d, host %s, elevated=%s ---"
             % (os.getpid(), THIS_HOST, bool(ctypes.windll.shell32.IsUserAnAdmin())))
+        global PANEL
+        PANEL = self                    # so the web view can read the phrases
         self.listening = start_listener()
         for target in REMOTE_SSH:
             threading.Thread(target=pull_from, args=(target,), daemon=True).start()
@@ -1174,6 +1284,15 @@ class Panel(tk.Tk):
         self._bind_field("say", label, say)
         return {"row": row, "head": head, "btn": name, "mute": mute, "say": say}
 
+    def web_ack(self, label):
+        """Clear a card on behalf of the web view, local or remote."""
+        record = read_statuses().get(label)
+        if record and record["remote"]:
+            self.ack_remote(label)
+        else:
+            clear_status(label)
+            self._states.pop(label, None)
+
     def ack_remote(self, label):
         """Clear a remote card: locally, and on the machine that reported it."""
         states = read_statuses()
@@ -1201,6 +1320,8 @@ class Panel(tk.Tk):
         self.update_lights()
 
     def update_lights(self):
+        while ACK_QUEUE:                # cleared from the web view, on this thread
+            self.web_ack(ACK_QUEUE.pop(0))
         states = read_statuses()
         for label, record in states.items():
             if (record["state"] in NOTIFY_ON

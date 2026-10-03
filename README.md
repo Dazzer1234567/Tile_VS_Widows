@@ -113,6 +113,24 @@ netsh advfirewall firewall add rule name="VS Code panel" dir=in action=allow ^
       protocol=TCP localport=8765 profile=private
 ```
 
+### The web view
+The same listener serves a page, so any machine on the tailnet can see the sessions:
+
+```
+http://100.74.240.93:8765/
+```
+
+`GET /` is a self-contained page (no CDN, no build step), `GET /api/cards` is the JSON it polls every two seconds, and `POST /api/ack` clears a card. `POST /status` is unchanged, so hooks keep working alongside it.
+
+Window actions and the app restart are deliberately **not** exposed. Raising a window on this machine means nothing from a browser elsewhere, and restarting an app from a phone is an easy way to kill something by accident. Clearing a card is the one action that makes sense remotely, and it is the same acknowledgement the panel itself uses — including reaching across SSH for a pulled card.
+
+An acknowledgement from the page is queued in `ACK_QUEUE` rather than acted on in the handler: that code runs on an HTTP thread, and clearing touches Tk widgets, which only the UI thread may do. `update_lights()` drains it.
+
+Two things to know:
+
+- It binds to the **Tailscale address**, so it is reachable from your tailnet and not from the LAN or anything public. There is no authentication — anyone who can reach the address can view and clear cards.
+- A machine on a *different* Tailscale account, shared in, **cannot reach it**, for the same one-way reason it cannot POST. The page is for your own devices.
+
 ### The log
 `%APPDATA%\vscode_panel\panel.log` records panel startup (with PID and whether it is elevated), every finish that queues a restart, and then each round of the sweep: every candidate process, *why* it matched, how many windows it was asked to close, and whether terminating it succeeded. A process that cannot be opened is called out explicitly, with the likely reason — an elevated app cannot be managed by a panel that is not. It rolls to `panel.log.1` past `LOG_MAX_BYTES`, and every logging failure is swallowed: logging must never break the panel.
 
