@@ -13,6 +13,11 @@ in which case the record is POSTed there instead of written to this machine's
 %TEMP%.  If that panel cannot be reached the record is written locally instead,
 so nothing is lost.
 
+To register it on the machine it should report from, rather than editing
+settings.json by hand:
+    python claude_hook.py --install                           (a panel on this machine)
+    python claude_hook.py --install http://<panel-host>:8765/status
+
 Add to ~/.claude/settings.json (use double backslashes in the path):
 
 {
@@ -63,6 +68,51 @@ def post(url, record):
         write_local(record)
 
 
+def install(url=""):
+    """Register this file for all three events in this machine's Claude Code settings.
+
+    Merges rather than replaces, keeps a .bak, and rewrites its own entries if they are
+    already there - so re-running with a different URL repoints an existing install."""
+    path = os.path.join(os.path.expanduser("~"), ".claude", "settings.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    except Exception as exc:
+        print("cannot read %s: %s" % (path, exc))
+        return 1
+
+    me = os.path.abspath(__file__)
+    hooks = data.setdefault("hooks", {})
+    for event in STATE_FOR_EVENT:
+        entry = {"hooks": [{"type": "command", "command": sys.executable,
+                            "args": [me, event] + ([url] if url else []),
+                            "timeout": 5}]}
+        others = [e for e in hooks.get(event, [])
+                  if os.path.basename(me).lower() not in json.dumps(e).lower()]
+        hooks[event] = others + [entry]         # ours last, anything else untouched
+
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                backup = f.read()
+            with open(path + ".bak", "w", encoding="utf-8") as f:
+                f.write(backup)
+        except Exception:
+            pass
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print("registered %s" % me)
+    print("  python   : %s" % sys.executable)
+    print("  events   : %s" % ", ".join(STATE_FOR_EVENT))
+    print("  reporting: %s" % (url or "this machine's %TEMP%"))
+    print("  settings : %s" % path)
+    print("\nRestart the VS Code windows so Claude Code reloads its hooks.")
+    return 0
+
+
 def main():
     try:
         data = json.load(sys.stdin)
@@ -87,4 +137,7 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--install" in sys.argv:
+        rest = [a for a in sys.argv[2:] if a != "--install"]
+        sys.exit(install(rest[0] if rest else ""))
     main()
