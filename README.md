@@ -96,6 +96,8 @@ The panel serves `StatusHandler` on a daemon thread and writes what arrives into
 
 Every record carries `host`, and the UI key becomes `"<host>: <project>"` for a remote session. Without that, two machines each running a project called `build` would overwrite one another's status, phrase and mute setting.
 
+When two files map to the same label — a status file written before hosts were stamped has no `host`, so it reads as local and collides with the host-stamped file that replaced it — the **newest wins**. Letting the last file seen win was a real fault: a frozen old record shadowed the live one, and because its `(state, timestamp)` never changed, no transition was ever detected and *nothing* fired — no sound, no phrase, no restart. Forty-nine such files had accumulated here, one a ten-hour-old `done` that hid a live session completely.
+
 A remote session has no window here, so `_remote_card()` builds a reduced card: colour, speaker toggle and phrase box, but the project name is a **`Label`, not a Max button** — there is nothing on this machine to raise — and **no restart controls at all**. `alert()` also returns early for a remote record before reaching the restart, because firing it would close and relaunch an app *on the wrong computer*. That is the one genuinely dangerous failure mode in this feature, so it is blocked in both the UI and the logic.
 
 `refresh()` folds the remote labels into its signature, or a card for a session that just appeared would never be built.
