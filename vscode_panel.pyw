@@ -26,9 +26,12 @@ import ctypes
 import json
 import ctypes.wintypes as wt
 import hashlib
+import http.server
 import math
 import os
+import platform
 import re
+import socket
 import subprocess
 import tempfile
 import threading
@@ -52,6 +55,10 @@ STATUS_DIR = os.path.join(tempfile.gettempdir(), "vscode_panel_status")   # writ
 PREFS_PATH = os.path.join(os.environ.get("APPDATA") or tempfile.gettempdir(),
                           "vscode_panel", "prefs.json")
 LOG_PATH = os.path.join(os.path.dirname(PREFS_PATH), "panel.log")
+THIS_HOST = platform.node()
+LISTEN_PORT = 8765                       # where hooks on other machines POST their status
+LISTEN_HOST = ""                         # "" = this machine's Tailscale address if it has
+                                         # one, else every interface.  Set to None to not listen.
 SOUND_ON, SOUND_OFF = "🔊", "🔇"     # speaker / muted speaker
 SOUND_ON_BG, SOUND_OFF_BG = "#1f6feb", "#e5484d"      # blue when sounding, red when muted
 SOUND_FONT = ("Segoe UI Emoji", 12)      # speaker on a card
@@ -367,23 +374,47 @@ def scroll_steps(wins):
 
 
 def read_statuses():
-    """{project name: (state, timestamp)} from the files claude_hook.py writes.
+    """{label: record} from the files claude_hook.py writes, locally or over HTTP.
 
-    The timestamp matters: two Stops in a row write the same state, and comparing
-    states alone would see no change and fire nothing.  That happens whenever the
-    "working" in between is not caught by the poll - any turn shorter than
-    REFRESH_MS - so the phrase and the app restart were silently skipped."""
+    The label is the bare project name for a session on this machine, and
+    "<host>: <project>" for one on another, so two machines running a project of the
+    same name cannot overwrite each other in the UI or in your saved phrases.
+
+    Each record keeps its timestamp, which matters: two Stops in a row write the same
+    state, and comparing states alone would see no change and fire nothing.  That
+    happens whenever the "working" in between is not caught by the poll - any turn
+    shorter than REFRESH_MS - and silently skipped the phrase and the app restart."""
     out = {}
     if not os.path.isdir(STATUS_DIR):
         return out
     for fn in os.listdir(STATUS_DIR):
+        path = os.path.join(STATUS_DIR, fn)
         try:
-            with open(os.path.join(STATUS_DIR, fn)) as f:
+            with open(path) as f:
                 d = json.load(f)
-            out[d["project"]] = (d["state"], d.get("time", 0))
+            host = d.get("host") or THIS_HOST       # files from before hosts were stamped
+            remote = host.lower() != THIS_HOST.lower()
+            project = d["project"]
+            label = "%s: %s" % (host, project) if remote else project
+            out[label] = {"state": d["state"], "time": d.get("time", 0), "host": host,
+                          "project": project, "remote": remote, "path": path}
         except Exception:
             pass
     return out
+
+
+def stamps(states):
+    """Just the (state, time) of each label, which is what a transition compares."""
+    return {label: (r["state"], r["time"]) for label, r in states.items()}
+
+
+def save_status(record):
+    """Store a record that arrived over HTTP exactly where a local one would go, so
+    everything downstream - colours, phrases, transitions - needs no special case."""
+    name = re.sub(r"[^\w.-]", "_", "%s~%s" % (record.get("host", "?"), record["project"]))
+    os.makedirs(STATUS_DIR, exist_ok=True)
+    with open(os.path.join(STATUS_DIR, name + ".json"), "w") as f:
+        json.dump(record, f)
 
 
 LOG_LOCK = threading.Lock()
@@ -432,12 +463,71 @@ def write_prefs(d):
         pass                        # a preference is not worth crashing the panel over
 
 
-def clear_status(project):
-    safe = re.sub(r"[^\w.-]", "_", project)
+def clear_status(label, states=None):
+    """Delete whichever file backs this label.  Looked up rather than recomputed from
+    the name: the file is named by host and project, which the label alone does not give."""
+    record = (states if states is not None else read_statuses()).get(label)
+    if not record:
+        return
     try:
-        os.remove(os.path.join(STATUS_DIR, safe + ".json"))
+        os.remove(record["path"])
     except OSError:
         pass
+
+
+# ---- status from other machines --------------------------------------------
+def tailscale_ip():
+    """This machine's Tailscale address, if it has one.  Binding to that rather than to
+    every interface keeps the listener off the LAN and off anything public."""
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            octets = ip.split(".")
+            if octets[0] == "100" and 64 <= int(octets[1]) <= 127:  # Tailscale's CGNAT range
+                return ip
+    except Exception:
+        pass
+    return ""
+
+
+class StatusHandler(http.server.BaseHTTPRequestHandler):
+    """Accepts one POST per hook event from a panel-less machine."""
+
+    def do_POST(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            record = json.loads(self.rfile.read(length).decode("utf-8"))
+            if not record.get("project") or not record.get("state"):
+                raise ValueError("missing project or state")
+            record.setdefault("host", self.client_address[0])
+            record.setdefault("time", time.time())
+            save_status(record)
+            log("received from %s: %s = %s"
+                % (record["host"], record["project"], record["state"]))
+            self.send_response(204)
+        except Exception as exc:
+            log("rejected a POST from %s: %r" % (self.client_address[0], exc))
+            self.send_response(400)
+        self.end_headers()
+
+    def log_message(self, *args):
+        pass                        # the panel has its own log; keep http.server quiet
+
+
+def start_listener():
+    """Serve on a daemon thread.  Returns the address it bound to, or "" if it could not."""
+    if LISTEN_HOST is None:
+        return ""
+    host = LISTEN_HOST or tailscale_ip()
+    try:
+        server = http.server.ThreadingHTTPServer((host, LISTEN_PORT), StatusHandler)
+    except OSError as exc:
+        log("could not listen on %s:%d - %s" % (host or "*", LISTEN_PORT, exc))
+        return ""
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    where = "%s:%d" % (host or "*", LISTEN_PORT)
+    log("listening for remote status on %s" % where)
+    return where
 
 
 # ---- close and reopen an app ------------------------------------------------
@@ -842,15 +932,16 @@ class Panel(tk.Tk):
 
         # notifications: seed from what is already on disk so a status file left
         # over from a previous run does not fire the moment the panel starts
-        self._states = read_statuses()
+        self._states = stamps(read_statuses())
         self._bg = self.cget("bg")          # what an idle row looks like
         self._hwnd = self.panel_hwnd()
         self._tray = Tray(self._hwnd)
         self.protocol("WM_DELETE_WINDOW", self.close)
         self.bind("<FocusIn>", lambda e: self.stop_flash())
 
-        log("--- panel started: pid %d, elevated=%s ---"
-            % (os.getpid(), bool(ctypes.windll.shell32.IsUserAnAdmin())))
+        log("--- panel started: pid %d, host %s, elevated=%s ---"
+            % (os.getpid(), THIS_HOST, bool(ctypes.windll.shell32.IsUserAnAdmin())))
+        self.listening = start_listener()
         self.refresh()
 
     def save(self):
@@ -919,12 +1010,16 @@ class Panel(tk.Tk):
     # -- per-window buttons
     def refresh(self):
         wins = vscode_windows()
-        sig = tuple((h, project_name(t)) for h, t in wins)
+        states = read_statuses()
+        # a remote session has no window here, so the signature has to notice it
+        # appearing or going away, or its card would never be built
+        remotes = sorted(l for l, r in states.items() if r["remote"])
+        sig = (tuple((h, project_name(t)) for h, t in wins), tuple(remotes))
         if sig != self._sig and not self._busy:
             self._sig = sig
             for w in self.list.winfo_children():
                 w.destroy()
-            self.rows = {}                      # project -> [(row frame, button), ...]
+            self.rows = {}                      # label -> [{widget name: widget}, ...]
             seen = {}
             for h, t in wins:
                 proj = project_name(t)
@@ -960,44 +1055,73 @@ class Panel(tk.Tk):
                 self._bind_field("run", proj, run)
                 # a list: two windows can share a folder name, and the hook writes one
                 # status file per name, so both rows must show that same state
-                self.rows.setdefault(proj, []).append((row, head, btn, mute, say, run, rbtn))
-            if not wins:
+                self.rows.setdefault(proj, []).append(
+                    {"row": row, "head": head, "btn": btn, "mute": mute,
+                     "say": say, "run": run, "rbtn": rbtn})
+            for label in remotes:
+                self.rows.setdefault(label, []).append(self._remote_card(label))
+            if not wins and not remotes:
                 tk.Label(self.list, text="no VS Code windows").pack()
         self.update_lights()
         self.after(REFRESH_MS, self.refresh)
+
+    def _remote_card(self, label):
+        """A session on another machine: colour, sound and phrase, but no window
+        controls.  There is nothing here to raise, and no app here to restart - firing
+        the restart would close and relaunch something on the wrong computer."""
+        row = tk.Frame(self.list)
+        row.pack(fill="x", pady=1)
+        head = tk.Frame(row)
+        head.pack(fill="x")
+        mute = tk.Button(head, font=SOUND_FONT, width=2, relief="flat", bd=1,
+                         padx=0, pady=0, command=lambda l=label: self.toggle_sound(l))
+        mute.pack(side="left", padx=(1, 0))
+        name = tk.Label(head, text=label, anchor="w", font=FIELD_FONT)  # label, not button
+        name.pack(side="left", fill="x", expand=True, padx=1)
+        say = tk.Entry(row, width=SAY_WIDTH, font=FIELD_FONT)
+        say.insert(0, self.say.get(label, ""))
+        say.pack(fill="x", padx=1, pady=(1, 1))
+        self._bind_field("say", label, say)
+        return {"row": row, "head": head, "btn": name, "mute": mute, "say": say}
 
     def focus_window(self, hwnd, project):
         maximize(hwnd)
         # Opening a window only settles a state that has stopped changing.  "working"
         # is still in progress, so it stays amber until the hook says otherwise -
         # clearing it would blank the row while Claude is still going.
-        if read_statuses().get(project, ("idle", 0))[0] != "working":
-            clear_status(project)       # you've looked at it; the row goes back to plain
+        states = read_statuses()
+        if states.get(project, {}).get("state") != "working":
+            clear_status(project, states)   # you've looked at it; the row goes back to plain
             self._states.pop(project, None)
         self.stop_flash()
         self.update_lights()
 
     def update_lights(self):
         states = read_statuses()
-        for proj, (state, stamp) in states.items():
-            if state in NOTIFY_ON and self._states.get(proj) != (state, stamp):
-                self.alert(proj, state)
-        self._states = states
-        for proj, widgets in getattr(self, "rows", {}).items():
-            colour = STATUS_COLORS.get(states.get(proj, ("idle", 0))[0]) or self._bg
-            muted = proj in self.muted
+        for label, record in states.items():
+            if (record["state"] in NOTIFY_ON
+                    and self._states.get(label) != (record["state"], record["time"])):
+                self.alert(label, record["state"], record)
+        self._states = stamps(states)
+        for label, widgets in getattr(self, "rows", {}).items():
+            record = states.get(label)
+            colour = STATUS_COLORS.get(record["state"] if record else "idle") or self._bg
+            muted = label in self.muted
             icon = SOUND_OFF if muted else SOUND_ON
             sound_bg = SOUND_OFF_BG if muted else SOUND_ON_BG
-            path = self.run.get(proj, "").strip()
+            path = self.run.get(label, "").strip()
             bad = bool(path) and not os.path.isfile(path)   # say so, rather than silently no-op
-            run_bg = RESTART_OFF_BG if proj in self.run_off else RESTART_ON_BG
-            for row, head, btn, mute, _say, run, rbtn in widgets:
-                row.configure(bg=colour)
-                head.configure(bg=colour)
-                btn.configure(bg=colour, activebackground=colour)
-                mute.configure(text=icon, bg=sound_bg, activebackground=sound_bg)
-                run.configure(bg=BAD_PATH_BG if bad else "white")
-                rbtn.configure(bg=run_bg, activebackground=run_bg)
+            run_bg = RESTART_OFF_BG if label in self.run_off else RESTART_ON_BG
+            for w in widgets:
+                w["row"].configure(bg=colour)
+                w["head"].configure(bg=colour)
+                w["btn"].configure(bg=colour)
+                if isinstance(w["btn"], tk.Button):
+                    w["btn"].configure(activebackground=colour)
+                w["mute"].configure(text=icon, bg=sound_bg, activebackground=sound_bg)
+                if "run" in w:                  # a remote card has no restart controls
+                    w["run"].configure(bg=BAD_PATH_BG if bad else "white")
+                    w["rbtn"].configure(bg=run_bg, activebackground=run_bg)
 
     def show_extras(self, open_):
         """Preview and volume are wanted rarely, so they stay collapsed behind the caret
@@ -1099,13 +1223,15 @@ class Panel(tk.Tk):
         self.save()
         self.update_lights()
 
-    def alert(self, project, state):
+    def alert(self, project, state, record=None):
         """A window just changed to a state worth interrupting you for."""
         if NOTIFY_SOUND and project not in self.muted:
             text = self.say.get(project, "").strip()
             # the phrase is for "it has stopped"; red keeps its own falling tone
             if not (state == "done" and text and speak(text, self.volume)):
                 play_alert(state, self.volume)
+        if (record or {}).get("remote"):
+            return                      # the app, if any, lives on the other machine
         if state == "done" and project not in self.run_off:
             path = self.run.get(project, "").strip()
             if path:                    # threaded: it sleeps out the settle delay

@@ -83,6 +83,30 @@ Two limits worth knowing:
 - **Path only, no arguments.** The whole string is taken as the executable.
 - **Windows execution aliases** (Store apps, winget stubs) run from a different image path than the one you launch: the `notepad.exe` in System32 actually runs from `WindowsApps`. A strict comparison cannot match those, so the first restart of such an app closes nothing. `launch_app()` records what the alias really resolved to, so every restart after that works. Ordinary installed applications and build outputs are unaffected — their launch path *is* their image path.
 
+### Sessions on another machine
+A Claude session on a different PC can appear in this panel. The hook there POSTs its record instead of writing a file:
+
+```
+python claude_hook.py Stop http://100.74.240.93:8765/status
+```
+
+— `argv[2]`, or the `VSCODE_PANEL_URL` environment variable. If the panel cannot be reached the record is written to that machine's `%TEMP%` instead, so nothing is lost and a local panel there would still see it.
+
+The panel serves `StatusHandler` on a daemon thread and writes what arrives into the **same** `STATUS_DIR` a local hook uses — so colours, phrases and transition detection need no special case for remote sessions at all. `tailscale_ip()` binds the listener to this machine's Tailscale address (the `100.64.0.0/10` range) rather than every interface, keeping it off the LAN and off anything public; `LISTEN_HOST` overrides that, and `None` disables listening.
+
+Every record carries `host`, and the UI key becomes `"<host>: <project>"` for a remote session. Without that, two machines each running a project called `build` would overwrite one another's status, phrase and mute setting.
+
+A remote session has no window here, so `_remote_card()` builds a reduced card: colour, speaker toggle and phrase box, but the project name is a **`Label`, not a Max button** — there is nothing on this machine to raise — and **no restart controls at all**. `alert()` also returns early for a remote record before reaching the restart, because firing it would close and relaunch an app *on the wrong computer*. That is the one genuinely dangerous failure mode in this feature, so it is blocked in both the UI and the logic.
+
+`refresh()` folds the remote labels into its signature, or a card for a session that just appeared would never be built.
+
+**Windows Firewall:** the listener binds fine, but inbound connections need allowing once, from an elevated prompt:
+
+```
+netsh advfirewall firewall add rule name="VS Code panel" dir=in action=allow ^
+      protocol=TCP localport=8765 profile=private
+```
+
 ### The log
 `%APPDATA%\vscode_panel\panel.log` records panel startup (with PID and whether it is elevated), every finish that queues a restart, and then each round of the sweep: every candidate process, *why* it matched, how many windows it was asked to close, and whether terminating it succeeded. A process that cannot be opened is called out explicitly, with the likely reason — an elevated app cannot be managed by a panel that is not. It rolls to `panel.log.1` past `LOG_MAX_BYTES`, and every logging failure is swallowed: logging must never break the panel.
 
