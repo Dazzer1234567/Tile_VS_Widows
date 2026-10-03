@@ -100,7 +100,11 @@ A remote session has no window here, so `_remote_card()` builds a reduced card: 
 
 `refresh()` folds the remote labels into its signature, or a card for a session that just appeared would never be built.
 
-**Windows Firewall:** the listener binds fine, but inbound connections need allowing once, from an elevated prompt:
+**When the other machine cannot reach you.** Tailscale *sharing* grants traffic one way: a node belonging to a different account can be reached from here, but cannot open connections back. `tailscale ping` still pongs (the daemon answers that, not the packet filter), which makes it look routable while every TCP port and even ICMP is dropped — no firewall rule changes that, only a tailnet ACL. So for such a machine the panel **pulls instead of being pushed**: `pull_from()` holds one long-lived `ssh` connection running a loop that prints each of that machine's status files every `REMOTE_POLL_S`, and the panel's reader thread feeds them through `save_status()` like anything else. One connection, not a process per poll, re-established if the machine sleeps. List those targets in `REMOTE_SSH`, and register the hook there with **no** URL so it writes locally and never waits on an unreachable panel.
+
+Acknowledging a pulled card has to reach across: the file lives on the other machine, so clearing only the local copy would see it restored seconds later and never clear. `ack_remote()` deletes it over SSH, *and* records the acknowledged timestamp in `ACKED`, which `save_status()` honours — without that, a line already in flight from the pull revives the card the instant after you clear it. That is why a remote card's name is a button at all: with no window here to raise, acknowledging is the only thing clicking it can usefully do.
+
+**Windows Firewall:** for a machine that *can* reach you, the listener binds fine but inbound connections need allowing once, from an elevated prompt:
 
 ```
 netsh advfirewall firewall add rule name="VS Code panel" dir=in action=allow ^

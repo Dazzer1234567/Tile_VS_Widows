@@ -59,6 +59,10 @@ THIS_HOST = platform.node()
 LISTEN_PORT = 8765                       # where hooks on other machines POST their status
 LISTEN_HOST = ""                         # "" = this machine's Tailscale address if it has
                                          # one, else every interface.  Set to None to not listen.
+REMOTE_SSH = ["hal-daw"]                 # ssh targets to PULL status from, for a machine that
+                                         # cannot reach us - see pull_from() for why
+REMOTE_POLL_S = 2                        # how often the remote end re-reads its own files
+REMOTE_RETRY_S = 20                      # wait before reconnecting to a target that dropped
 SOUND_ON, SOUND_OFF = "🔊", "🔇"     # speaker / muted speaker
 SOUND_ON_BG, SOUND_OFF_BG = "#1f6feb", "#e5484d"      # blue when sounding, red when muted
 SOUND_FONT = ("Segoe UI Emoji", 12)      # speaker on a card
@@ -408,12 +412,28 @@ def stamps(states):
     return {label: (r["state"], r["time"]) for label, r in states.items()}
 
 
+def status_name(host, project):
+    """The file name a record lands under.  Shared with claude_hook.py, and with the
+    remote cleanup in ack_remote(), which has to name a file on another machine."""
+    return re.sub(r"[^\w.-]", "_", "%s~%s" % (host, project)) + ".json"
+
+
+ACKED = {}                      # (host, project) -> newest record time acknowledged
+
+
 def save_status(record):
-    """Store a record that arrived over HTTP exactly where a local one would go, so
-    everything downstream - colours, phrases, transitions - needs no special case."""
-    name = re.sub(r"[^\w.-]", "_", "%s~%s" % (record.get("host", "?"), record["project"]))
+    """Store a record that arrived from elsewhere exactly where a local one would go, so
+    everything downstream - colours, phrases, transitions - needs no special case.
+
+    A record no newer than the one you acknowledged is dropped: the pull prints every
+    file every couple of seconds, so a line already in flight would otherwise revive a
+    card the moment after you cleared it."""
+    key = (record.get("host", "?"), record["project"])
+    if record.get("time", 0) <= ACKED.get(key, 0):
+        return
     os.makedirs(STATUS_DIR, exist_ok=True)
-    with open(os.path.join(STATUS_DIR, name + ".json"), "w") as f:
+    path = os.path.join(STATUS_DIR, status_name(record.get("host", "?"), record["project"]))
+    with open(path, "w") as f:
         json.dump(record, f)
 
 
@@ -528,6 +548,63 @@ def start_listener():
     where = "%s:%d" % (host or "*", LISTEN_PORT)
     log("listening for remote status on %s" % where)
     return where
+
+
+# the remote end just prints each of its status files, once per REMOTE_POLL_S
+REMOTE_STREAM = (
+    "while ($true) { "
+    "Get-ChildItem \"$env:TEMP\\vscode_panel_status\\*.json\" -ErrorAction SilentlyContinue | "
+    "ForEach-Object { (Get-Content $_.FullName -Raw) -replace '\\s+',' ' }; "
+    "Start-Sleep -Seconds %d }"
+)
+
+
+def pull_from(target):
+    """Stream another machine's status files in over SSH, forever.
+
+    A machine on a different Tailscale account cannot open connections to us - sharing
+    grants traffic one way only - so it cannot POST.  SSH from here to it does work, so
+    its records are pulled rather than pushed.  One long-lived connection that prints a
+    line per file, rather than a process per poll, and it is re-established if the
+    machine sleeps or reboots."""
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=30",
+           "-o", "StrictHostKeyChecking=accept-new", target, REMOTE_STREAM % REMOTE_POLL_S]
+    while True:
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    creationflags=CREATE_NO_WINDOW, text=True,
+                                    encoding="utf-8", errors="replace")
+            log("pulling status from %s over ssh" % target)
+            for line in proc.stdout:
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue                    # ssh banners and the like
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                if record.get("project") and record.get("state"):
+                    save_status(record)
+            proc.wait()
+            log("ssh pull from %s ended" % target)
+        except Exception as exc:
+            log("ssh pull from %s failed: %r" % (target, exc))
+        time.sleep(REMOTE_RETRY_S)
+
+
+def forget_remote(target, host, project):
+    """Delete the status file on the machine it came from, so the pull stops restoring it.
+    Acknowledging a remote card has to reach across, or it would turn green again in
+    REMOTE_POLL_S seconds and never clear."""
+    remote = "Remove-Item -Force -ErrorAction SilentlyContinue " \
+             "\"$env:TEMP\\vscode_panel_status\\%s\"" % status_name(host, project)
+    try:
+        subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", target, remote],
+                       creationflags=CREATE_NO_WINDOW, timeout=20,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        log("cleared %s on %s" % (project, host))
+    except Exception as exc:
+        log("could not clear %s on %s: %r" % (project, host, exc))
 
 
 # ---- close and reopen an app ------------------------------------------------
@@ -942,6 +1019,8 @@ class Panel(tk.Tk):
         log("--- panel started: pid %d, host %s, elevated=%s ---"
             % (os.getpid(), THIS_HOST, bool(ctypes.windll.shell32.IsUserAnAdmin())))
         self.listening = start_listener()
+        for target in REMOTE_SSH:
+            threading.Thread(target=pull_from, args=(target,), daemon=True).start()
         self.refresh()
 
     def save(self):
@@ -1076,13 +1155,31 @@ class Panel(tk.Tk):
         mute = tk.Button(head, font=SOUND_FONT, width=2, relief="flat", bd=1,
                          padx=0, pady=0, command=lambda l=label: self.toggle_sound(l))
         mute.pack(side="left", padx=(1, 0))
-        name = tk.Label(head, text=label, anchor="w", font=FIELD_FONT)  # label, not button
+        # a button, but it acknowledges rather than raising a window: there is no
+        # window here to raise, and a remote card needs some way to be cleared
+        name = tk.Button(head, text=label, anchor="w", relief="flat", bd=1,
+                         font=FIELD_FONT, pady=0,
+                         command=lambda l=label: self.ack_remote(l))
         name.pack(side="left", fill="x", expand=True, padx=1)
         say = tk.Entry(row, width=SAY_WIDTH, font=FIELD_FONT)
         say.insert(0, self.say.get(label, ""))
         say.pack(fill="x", padx=1, pady=(1, 1))
         self._bind_field("say", label, say)
         return {"row": row, "head": head, "btn": name, "mute": mute, "say": say}
+
+    def ack_remote(self, label):
+        """Clear a remote card: locally, and on the machine that reported it."""
+        states = read_statuses()
+        record = states.get(label)
+        clear_status(label, states)
+        if record:
+            ACKED[(record["host"], record["project"])] = record["time"]
+        if record and REMOTE_SSH:
+            threading.Thread(target=forget_remote,
+                             args=(REMOTE_SSH[0], record["host"], record["project"]),
+                             daemon=True).start()
+        self._states.pop(label, None)
+        self.update_lights()
 
     def focus_window(self, hwnd, project):
         maximize(hwnd)
