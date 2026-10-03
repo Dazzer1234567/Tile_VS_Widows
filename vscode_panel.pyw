@@ -400,7 +400,14 @@ def read_statuses():
             remote = host.lower() != THIS_HOST.lower()
             project = d["project"]
             label = "%s: %s" % (host, project) if remote else project
-            out[label] = {"state": d["state"], "time": d.get("time", 0), "host": host,
+            when = d.get("time", 0)
+            # Two files can map to one label - a pre-host-stamp file and its replacement
+            # both read as local - and the newest has to win.  Letting the last one seen
+            # win meant a frozen old record could shadow the live one: its (state, time)
+            # never changes, so no transition is ever detected and nothing fires at all.
+            if label in out and out[label]["time"] >= when:
+                continue
+            out[label] = {"state": d["state"], "time": when, "host": host,
                           "project": project, "remote": remote, "path": path}
         except Exception:
             pass
