@@ -123,7 +123,11 @@ The same listener serves a page, so any machine on the tailnet can see the sessi
 http://100.74.240.93:8765/
 ```
 
-`GET /` is a self-contained page (no CDN, no build step), `GET /api/cards` is the JSON it polls every two seconds, and `POST /api/ack` clears a card. `POST /status` is unchanged, so hooks keep working alongside it.
+`GET /` is a self-contained page (no CDN, no build step), `GET /api/cards` is the JSON it polls every two seconds, `GET /api/sound` returns the audio for a label, and `POST /api/ack` clears a card. `POST /status` is unchanged, so hooks keep working alongside it.
+
+**It speaks too.** The page watches each card's `time` and, when one turns `done` with a time it has not seen, plays `api/sound?label=…` — the panel's *own* rendering, so a browser on another machine hears the same voice saying the same phrase, or the same tone when a project has no phrase. A muted project stays silent, as it does here.
+
+Two details that matter: nothing plays on the **first** poll, or opening the page would announce everything that had already finished; and a browser refuses to play audio until a gesture has allowed it, so the sound toggle doubles as that gesture — it plays a silent clip on the click that enables it. The choice is kept in `localStorage`, per device.
 
 Window actions and the app restart are deliberately **not** exposed. Raising a window on this machine means nothing from a browser elsewhere, and restarting an app from a phone is an easy way to kill something by accident. Clearing a card is the one action that makes sense remotely, and it is the same acknowledgement the panel itself uses — including reaching across SSH for a pulled card.
 

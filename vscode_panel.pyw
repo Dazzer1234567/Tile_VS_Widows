@@ -34,6 +34,7 @@ import re
 import socket
 import subprocess
 import tempfile
+import urllib.parse
 import threading
 import time
 import wave
@@ -518,6 +519,8 @@ def web_cards():
         cards.append({"label": label, "project": r["project"], "host": r["host"],
                       "state": r["state"], "remote": r["remote"],
                       "age": max(0, int(now - r["time"])),
+                      "time": r["time"],      # the page watches this to spot a new event
+                      "muted": bool(PANEL and label in PANEL.muted),
                       "phrase": (PANEL.say.get(label, "") if PANEL else "")})
     return {"host": THIS_HOST, "cards": cards}
 
@@ -536,6 +539,25 @@ def claim_single_instance():
     global SINGLE_INSTANCE
     SINGLE_INSTANCE = kernel32.CreateMutexW(None, False, "vscode_panel_single_instance")
     return kernel32.GetLastError() != 183            # ERROR_ALREADY_EXISTS
+
+
+def sound_bytes(label):
+    """The WAV the page should play for this label: its spoken phrase if it has one,
+    otherwise the tone for its state.  The panel's own renderings, so a browser on
+    another machine hears exactly what this machine hears."""
+    record = read_statuses().get(label)
+    state = record["state"] if record else "done"
+    phrase = (PANEL.say.get(label, "").strip() if PANEL else "")
+    volume = PANEL.volume if PANEL else VOLUME_DEFAULT
+    path = ""
+    if phrase:
+        path = say_wav(phrase, volume)
+        if not os.path.exists(path):
+            path = render_speech(phrase, volume) or ""
+    if not path or not os.path.exists(path):
+        path = alert_wav(state, volume)
+    with open(path, "rb") as f:
+        return f.read()
 
 
 def tailscale_ip():
@@ -566,10 +588,9 @@ WEB_PAGE = """<!doctype html>
  body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
         font:15px/1.4 "Segoe UI",system-ui,sans-serif; }
  h1 { font-size:17px; margin:0 0 4px; font-weight:600; }
- .sub { color:var(--dim); font-size:12px; margin:0 0 16px; }
+ .sub { color:var(--dim); font-size:12px; margin:0 0 12px; }
  .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
          padding:10px 12px; margin-bottom:8px; cursor:pointer; -webkit-tap-highlight-color:transparent; }
- .card:active { transform:scale(.995); }
  .working { background:#f0b429; color:#18181b; border-color:#d9a21f; }
  .done    { background:#3ad35a; color:#18181b; border-color:#2fb84c; }
  .waiting { background:#ff5a4d; color:#18181b; border-color:#e5484d; }
@@ -578,13 +599,38 @@ WEB_PAGE = """<!doctype html>
  .empty { color:var(--dim); font-style:italic; }
  .tag { font-size:11px; border:1px solid currentColor; border-radius:4px;
         padding:0 4px; margin-left:6px; opacity:.75; }
+ #snd { font:13px/1 inherit; padding:7px 11px; margin-bottom:12px; cursor:pointer;
+        border:1px solid var(--line); border-radius:6px;
+        background:var(--card); color:var(--fg); }
+ #snd.on { background:#1f6feb; border-color:#1f6feb; color:#fff; }
 </style></head><body>
 <h1>Claude sessions</h1>
 <p class="sub" id="sub">connecting...</p>
+<button id="snd">\\ud83d\\udd07 sound off</button>
 <div id="cards"></div>
 <script>
 const AGO = s => s < 60 ? s + "s ago" : s < 3600 ? Math.floor(s/60) + "m ago"
                  : Math.floor(s/3600) + "h ago";
+let seen = {}, primed = false, sound = localStorage.getItem("sound") === "1";
+const btn = document.getElementById("snd");
+
+function paintBtn() {
+  btn.textContent = sound ? "\\ud83d\\udd0a sound on" : "\\ud83d\\udd07 sound off";
+  btn.className = sound ? "on" : "";
+}
+btn.onclick = () => {
+  sound = !sound;
+  localStorage.setItem("sound", sound ? "1" : "0");
+  // a browser will not play audio until a gesture has allowed it; this click is it
+  if (sound) { const a = new Audio("api/sound?label="); a.volume = 0; a.play().catch(()=>{}); }
+  paintBtn();
+};
+paintBtn();
+
+function say(label) {
+  new Audio("api/sound?label=" + encodeURIComponent(label) + "&t=" + Date.now())
+    .play().catch(() => {});
+}
 async function ack(label) {
   await fetch("api/ack", {method:"POST", headers:{"Content-Type":"application/json"},
                           body: JSON.stringify({label})});
@@ -597,6 +643,15 @@ async function tick() {
   document.getElementById("sub").textContent =
     "on " + d.host + " \\u00b7 " + d.cards.length + " session" +
     (d.cards.length === 1 ? "" : "s") + " \\u00b7 tap a card to clear it";
+  for (const c of d.cards) {
+    // only a NEW event counts, and never on the first load, or opening the page
+    // would announce everything that had already finished
+    if (primed && sound && !c.muted && c.state === "done" && seen[c.label] !== c.time) {
+      say(c.label);
+    }
+    seen[c.label] = c.time;
+  }
+  primed = true;
   const box = document.getElementById("cards");
   if (!d.cards.length) { box.innerHTML = '<p class="empty">nothing reporting</p>'; return; }
   box.innerHTML = d.cards.map(c =>
@@ -629,6 +684,14 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
         route = self.path.split("?")[0].rstrip("/") or "/"
         if route in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", WEB_PAGE.encode("utf-8"))
+        elif route == "/api/sound":
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            label = (query.get("label") or [""])[0]
+            try:
+                self._send(200, "audio/wav", sound_bytes(label))
+            except Exception as exc:
+                log("could not build audio for %r: %r" % (label, exc))
+                self._send(404, "text/plain; charset=utf-8", b"no audio")
         elif route == "/api/cards":
             self._send(200, "application/json",
                        json.dumps(web_cards()).encode("utf-8"))
