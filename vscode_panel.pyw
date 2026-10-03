@@ -237,6 +237,7 @@ class NOTIFYICONDATA(ctypes.Structure):
 user32.LoadImageW.restype = wt.HANDLE
 kernel32.CreateToolhelp32Snapshot.restype = wt.HANDLE
 kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.CreateMutexW.restype = wt.HANDLE
 user32.LoadIconW.restype = wt.HICON
 
 EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
@@ -519,6 +520,22 @@ def web_cards():
                       "age": max(0, int(now - r["time"])),
                       "phrase": (PANEL.say.get(label, "") if PANEL else "")})
     return {"host": THIS_HOST, "cards": cards}
+
+
+SINGLE_INSTANCE = None          # the mutex handle, held for the life of the process
+
+
+def claim_single_instance():
+    """False if a panel is already running.
+
+    Worth enforcing: Windows lets a second process bind the listener port that the first
+    one already holds, so two panels do not fail loudly - they quietly split incoming
+    requests between them, and both act on every finish, restarting the app twice.  With
+    the panel starting automatically and a shortcut on the Desktop, running two became
+    easy to do by accident."""
+    global SINGLE_INSTANCE
+    SINGLE_INSTANCE = kernel32.CreateMutexW(None, False, "vscode_panel_single_instance")
+    return kernel32.GetLastError() != 183            # ERROR_ALREADY_EXISTS
 
 
 def tailscale_ip():
@@ -1475,4 +1492,7 @@ class Panel(tk.Tk):
 
 
 if __name__ == "__main__":
-    Panel().mainloop()
+    if not claim_single_instance():
+        log("a panel is already running; this one is exiting")
+    else:
+        Panel().mainloop()

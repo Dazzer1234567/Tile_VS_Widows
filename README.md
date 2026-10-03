@@ -14,7 +14,7 @@ Darius works with four (or more) separate VS Code windows open at once, each a d
 
 ## Files
 
-- `vscode_panel.py` — the panel. Run with `pythonw` (or rename to `.pyw`) to avoid a console window. Put a shortcut in `shell:startup` to start with Windows.
+- `vscode_panel.pyw` — the panel. Run with `pythonw` to avoid a console window. A shortcut in `shell:startup` starts it with Windows, which also brings the web view up on boot; the Desktop shortcut points at the same file rather than being a second copy, since a copy silently goes stale and you end up testing old code without knowing.
 - `claude_hook.py` — Claude Code hook script. Writes per-project status files that the panel reads.
 - `vscode_tiler.py` — earlier hotkey-only version (Ctrl+Alt+T tile, Ctrl+Alt+H hide/show). Superseded by the panel; kept for reference.
 
@@ -112,6 +112,9 @@ Acknowledging a pulled card has to reach across: the file lives on the other mac
 netsh advfirewall firewall add rule name="VS Code panel" dir=in action=allow ^
       protocol=TCP localport=8765 profile=private
 ```
+
+### One panel at a time
+`claim_single_instance()` takes a named mutex and the second panel exits. This is worth enforcing rather than leaving to habit: Windows lets a second process bind a listener port the first already holds, so two panels do not fail loudly — they quietly split incoming requests between them, and both act on every finish, restarting the app twice. Starting automatically *and* having a Desktop shortcut makes running two easy to do by accident.
 
 ### The web view
 The same listener serves a page, so any machine on the tailnet can see the sessions:
