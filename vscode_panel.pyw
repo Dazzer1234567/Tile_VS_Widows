@@ -69,6 +69,8 @@ REMOTE_POLL_S = 2                        # how often the remote end re-reads its
 REMOTE_RETRY_S = 20                      # wait before reconnecting to a target that dropped
 STALE_AFTER_S = 6 * 3600                 # a remote record older than this is treated as dead
 PUSH_TIMEOUT = 8                         # seconds; a push must never hold up the panel
+PUSH_PRIORITY = "high"                   # ntfy priority; "high" marks it time-sensitive, which
+                                         # is what gets it announced and past a Focus mode
 SOUND_ON, SOUND_OFF = "🔊", "🔇"     # speaker / muted speaker
 SOUND_ON_BG, SOUND_OFF_BG = "#1f6feb", "#e5484d"      # blue when sounding, red when muted
 SOUND_FONT = ("Segoe UI Emoji", 12)      # speaker on a card
@@ -713,7 +715,7 @@ def push(url, title, body):
         request = urllib.request.Request(
             url, data=body.encode("utf-8"), method="POST",
             headers={"Title": title.encode("utf-8").decode("latin-1", "replace"),
-                     "Priority": "default", "Tags": "white_check_mark"})
+                     "Priority": PUSH_PRIORITY})
         urllib.request.urlopen(request, timeout=PUSH_TIMEOUT).close()
         log("pushed to phone: %s - %s" % (title, body))
     except Exception as exc:
