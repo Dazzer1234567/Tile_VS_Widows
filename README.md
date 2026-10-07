@@ -140,6 +140,13 @@ Two things to know:
 - It binds to the **Tailscale address**, so it is reachable from your tailnet and not from the LAN or anything public. There is no authentication — anyone who can reach the address can view and clear cards.
 - A machine on a *different* Tailscale account, shared in, **cannot reach it**, for the same one-way reason it cannot POST. The page is for your own devices.
 
+### Dead sessions
+Status files were never cleaned up, so they accumulated for months. The panel hid that by accident — it builds its cards from *open VS Code windows*, so a record with no window was simply never drawn. The web view lists records rather than windows, which put the problem on screen: conversations closed days earlier, one of them 95 hours old.
+
+`is_live()` answers it differently for the two cases. A local record is answerable exactly — no window, no session — so `prune_dead()` deletes it, at startup and whenever the set of windows changes. A remote one is not: nothing tells us the other machine closed a window, so it falls back to age, `STALE_AFTER_S`.
+
+`prune_dead()` does nothing when it finds *no* windows at all, rather than concluding everything is dead — otherwise a transient enumeration failure, or running before the desktop is up, would delete every live record.
+
 ### The log
 `%APPDATA%\vscode_panel\panel.log` records panel startup (with PID and whether it is elevated), every finish that queues a restart, and then each round of the sweep: every candidate process, *why* it matched, how many windows it was asked to close, and whether terminating it succeeded. A process that cannot be opened is called out explicitly, with the likely reason — an elevated app cannot be managed by a panel that is not. It rolls to `panel.log.1` past `LOG_MAX_BYTES`, and every logging failure is swallowed: logging must never break the panel.
 

@@ -66,6 +66,7 @@ REMOTE_SSH = ["hal-daw"]                 # ssh targets to PULL status from, for 
                                          # cannot reach us - see pull_from() for why
 REMOTE_POLL_S = 2                        # how often the remote end re-reads its own files
 REMOTE_RETRY_S = 20                      # wait before reconnecting to a target that dropped
+STALE_AFTER_S = 6 * 3600                 # a remote record older than this is treated as dead
 SOUND_ON, SOUND_OFF = "🔊", "🔇"     # speaker / muted speaker
 SOUND_ON_BG, SOUND_OFF_BG = "#1f6feb", "#e5484d"      # blue when sounding, red when muted
 SOUND_FONT = ("Segoe UI Emoji", 12)      # speaker on a card
@@ -418,6 +419,37 @@ def read_statuses():
     return out
 
 
+def live_projects():
+    """Projects with a VS Code window open on this machine."""
+    return {project_name(t) for _hwnd, t in vscode_windows()}
+
+
+def is_live(record, live, now=None):
+    """Is this record a session that still exists?
+
+    A local one is answerable exactly: no window, no session.  A remote one is not -
+    nothing tells us the other machine closed a window - so it falls back to age.
+    Without this the records pile up for months, and the web view, which lists records
+    rather than windows, showed conversations that had been closed for days."""
+    if record["remote"]:
+        return (now or time.time()) - record["time"] <= STALE_AFTER_S
+    return record["project"] in live
+
+
+def prune_dead():
+    """Delete local records whose window has gone.  Nothing else ever clears them."""
+    live = live_projects()
+    if not live:
+        return                      # no windows found at all: do not mistake that for "all dead"
+    for record in read_statuses().values():
+        if not record["remote"] and record["project"] not in live:
+            try:
+                os.remove(record["path"])
+                log("dropped stale record for %s (no window open)" % record["project"])
+            except OSError:
+                pass
+
+
 def stamps(states):
     """Just the (state, time) of each label, which is what a transition compares."""
     return {label: (r["state"], r["time"]) for label, r in states.items()}
@@ -520,9 +552,12 @@ def web_cards():
     # the ones wanting attention first - on a phone you are looking for "which has
     # stopped", not reading an alphabetical list
     order = {"done": 0, "waiting": 1, "working": 2}
+    live = live_projects()
     items = sorted(read_statuses().items(),
                    key=lambda kv: (order.get(kv[1]["state"], 3), -kv[1]["time"]))
     for label, r in items:
+        if not is_live(r, live, now):
+            continue
         cards.append({"label": label, "project": r["project"], "host": r["host"],
                       "state": r["state"], "remote": r["remote"],
                       "age": max(0, int(now - r["time"])),
@@ -1266,6 +1301,7 @@ class Panel(tk.Tk):
             % (os.getpid(), THIS_HOST, bool(ctypes.windll.shell32.IsUserAnAdmin())))
         global PANEL
         PANEL = self                    # so the web view can read the phrases
+        prune_dead()                    # clear anything left behind by a previous run
         self.listening = start_listener()
         for target in REMOTE_SSH:
             threading.Thread(target=pull_from, args=(target,), daemon=True).start()
@@ -1340,10 +1376,13 @@ class Panel(tk.Tk):
         states = read_statuses()
         # a remote session has no window here, so the signature has to notice it
         # appearing or going away, or its card would never be built
-        remotes = sorted(l for l, r in states.items() if r["remote"])
+        now = time.time()
+        remotes = sorted(l for l, r in states.items()
+                         if r["remote"] and is_live(r, (), now))
         sig = (tuple((h, project_name(t)) for h, t in wins), tuple(remotes))
         if sig != self._sig and not self._busy:
             self._sig = sig
+            prune_dead()                # a window has closed or opened: clear what died
             for w in self.list.winfo_children():
                 w.destroy()
             self.rows = {}                      # label -> [{widget name: widget}, ...]
