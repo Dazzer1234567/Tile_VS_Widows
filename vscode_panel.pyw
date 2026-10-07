@@ -797,7 +797,14 @@ WEB_PAGE = """<!doctype html>
  button { font:13px/1 inherit; padding:8px 12px; cursor:pointer; color:var(--fg);
           border:1px solid var(--line); border-radius:7px; background:var(--card); }
  #snd.on { background:#1f6feb; border-color:#1f6feb; color:#fff; }
- #bar { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
+ #lbar, #cbar { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
+ /* the conversation opens scrolled to its newest message, so the way back has to stay
+    on screen rather than sit at the top of a transcript you must scroll up through */
+ #cbar { position:sticky; top:0; z-index:5; background:var(--bg);
+         padding:calc(8px + env(safe-area-inset-top)) 0 8px;
+         margin:calc(-16px - env(safe-area-inset-top)) 0 12px;
+         border-bottom:1px solid var(--line); }
+ #who { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
  .msg { max-width:86%; padding:9px 12px; border-radius:14px; margin-bottom:8px;
         white-space:pre-wrap; overflow-wrap:anywhere; font-size:14px; }
  .user { background:var(--me); color:#fff; margin-left:auto; border-bottom-right-radius:4px; }
@@ -807,13 +814,13 @@ WEB_PAGE = """<!doctype html>
 <div id="list">
   <h1>Claude sessions</h1>
   <p class="sub" id="sub">connecting...</p>
-  <div id="bar"><button id="snd"></button></div>
+  <div id="lbar"><button id="snd"></button></div>
   <div id="cards"></div>
 </div>
 
 <div id="convo" hidden>
-  <div id="bar"><button onclick="back()">\\u2039 back</button>
-                <span id="who" style="font-weight:600"></span></div>
+  <div id="cbar"><button onclick="back()">&larr; Back</button>
+                 <span id="who" style="font-weight:600"></span></div>
   <div id="msgs"></div>
 </div>
 
