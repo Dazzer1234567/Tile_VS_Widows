@@ -32,6 +32,7 @@ import os
 import platform
 import re
 import socket
+import struct
 import subprocess
 import tempfile
 import urllib.parse
@@ -40,6 +41,7 @@ import time
 import wave
 import tkinter as tk
 import winsound
+import zlib
 from tkinter import ttk
 
 user32 = ctypes.windll.user32
@@ -515,7 +517,12 @@ def web_cards():
     and restarting an app from a phone is a good way to kill something by accident."""
     now = time.time()
     cards = []
-    for label, r in sorted(read_statuses().items()):
+    # the ones wanting attention first - on a phone you are looking for "which has
+    # stopped", not reading an alphabetical list
+    order = {"done": 0, "waiting": 1, "working": 2}
+    items = sorted(read_statuses().items(),
+                   key=lambda kv: (order.get(kv[1]["state"], 3), -kv[1]["time"]))
+    for label, r in items:
         cards.append({"label": label, "project": r["project"], "host": r["host"],
                       "state": r["state"], "remote": r["remote"],
                       "age": max(0, int(now - r["time"])),
@@ -539,6 +546,39 @@ def claim_single_instance():
     global SINGLE_INSTANCE
     SINGLE_INSTANCE = kernel32.CreateMutexW(None, False, "vscode_panel_single_instance")
     return kernel32.GetLastError() != 183            # ERROR_ALREADY_EXISTS
+
+
+ICON_CACHE = {}
+
+
+def icon_png(size=180):
+    """The four-squares mark as a PNG, for the iOS home-screen icon.  Written by hand
+    with zlib and struct so the panel still needs nothing outside the standard library -
+    the same reason the .ico is embedded and the tones are generated."""
+    if size in ICON_CACHE:
+        return ICON_CACHE[size]
+    bg, fg = (244, 244, 245), (24, 24, 27)
+    gap = max(1, size // 10)
+    cell = (size - 3 * gap) // 2
+    spans = ((gap, gap + cell), (2 * gap + cell, 2 * gap + 2 * cell))
+    raw = bytearray()
+    for y in range(size):
+        raw.append(0)                               # filter: none
+        iny = any(a <= y < b for a, b in spans)
+        for x in range(size):
+            inx = any(a <= x < b for a, b in spans)
+            raw += bytes(fg if (inx and iny) else bg)
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+           + chunk(b"IEND", b""))
+    ICON_CACHE[size] = png
+    return png
 
 
 def sound_bytes(label):
@@ -577,20 +617,29 @@ def tailscale_ip():
 WEB_PAGE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Claude sessions</title>
+<link rel="apple-touch-icon" href="icon.png">
+<link rel="icon" href="icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Claude">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#18181b">
 <style>
  :root { --bg:#f4f4f5; --fg:#18181b; --card:#ffffff; --line:#d4d4d8; --dim:#71717a; }
  @media (prefers-color-scheme: dark) {
    :root { --bg:#18181b; --fg:#f4f4f5; --card:#27272a; --line:#3f3f46; --dim:#a1a1aa; }
  }
  * { box-sizing:border-box; }
- body { margin:0; padding:16px; background:var(--bg); color:var(--fg);
-        font:15px/1.4 "Segoe UI",system-ui,sans-serif; }
+ body { margin:0; background:var(--bg); color:var(--fg);
+        font:15px/1.4 -apple-system,"Segoe UI",system-ui,sans-serif;
+        padding:calc(16px + env(safe-area-inset-top)) 16px
+                calc(16px + env(safe-area-inset-bottom)); }
  h1 { font-size:17px; margin:0 0 4px; font-weight:600; }
  .sub { color:var(--dim); font-size:12px; margin:0 0 12px; }
- .card { background:var(--card); border:1px solid var(--line); border-radius:8px;
-         padding:10px 12px; margin-bottom:8px; cursor:pointer; -webkit-tap-highlight-color:transparent; }
+ .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+         padding:13px 14px; margin-bottom:9px; cursor:pointer;
+         -webkit-tap-highlight-color:transparent; user-select:none; }
  .working { background:#f0b429; color:#18181b; border-color:#d9a21f; }
  .done    { background:#3ad35a; color:#18181b; border-color:#2fb84c; }
  .waiting { background:#ff5a4d; color:#18181b; border-color:#e5484d; }
@@ -684,6 +733,8 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
         route = self.path.split("?")[0].rstrip("/") or "/"
         if route in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", WEB_PAGE.encode("utf-8"))
+        elif route == "/icon.png":
+            self._send(200, "image/png", icon_png())
         elif route == "/api/sound":
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             label = (query.get("label") or [""])[0]

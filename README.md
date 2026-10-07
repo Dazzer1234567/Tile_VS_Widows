@@ -133,6 +133,8 @@ Window actions and the app restart are deliberately **not** exposed. Raising a w
 
 An acknowledgement from the page is queued in `ACK_QUEUE` rather than acted on in the handler: that code runs on an HTTP thread, and clearing touches Tk widgets, which only the UI thread may do. `update_lights()` drains it.
 
+**On a phone** it installs: Safari's *Add to Home Screen* gives it an icon and opens it full screen with no browser chrome, via the `apple-mobile-web-app-*` tags, `viewport-fit=cover` and `env(safe-area-inset-*)` padding so it clears the notch. `icon_png()` draws the four-squares mark with `zlib` and `struct` rather than shipping a file — same reason the `.ico` is embedded and the tones are generated. Cards are ordered finished, then waiting, then working: on a phone you are looking for *which has stopped*, not reading an alphabetical list.
+
 Two things to know:
 
 - It binds to the **Tailscale address**, so it is reachable from your tailnet and not from the LAN or anything public. There is no authentication — anyone who can reach the address can view and clear cards.
