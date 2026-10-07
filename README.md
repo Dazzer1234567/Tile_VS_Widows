@@ -125,6 +125,10 @@ http://100.74.240.93:8765/
 
 `GET /` is a self-contained page (no CDN, no build step), `GET /api/cards` is the JSON it polls every two seconds, `GET /api/sound` returns the audio for a label, and `POST /api/ack` clears a card. `POST /status` is unchanged, so hooks keep working alongside it.
 
+**Tapping a card opens the conversation.** `GET /api/conversation?label=…` returns the last turns of that session's transcript. Claude Code keeps them as JSONL under `~/.claude/projects/<slug>/<session>.jsonl`; the hook now records `transcript_path`, which is exact, and `find_transcript()` falls back to matching the project against the directory names Claude Code derives from the working directory (underscores become dashes there) for records written before that. `read_conversation()` reads only the **tail** — these run to megabytes and only the end is ever shown — and keeps just the words, dropping thinking, tool calls and tool results so it reads like the conversation rather than a machine log. Clearing a card moved to the × in its corner, which stops the tap from propagating.
+
+A remote session's transcript lives on the other machine, so that card says so rather than showing an empty view.
+
 **It speaks too.** The page watches each card's `time` and, when one turns `done` with a time it has not seen, plays `api/sound?label=…` — the panel's *own* rendering, so a browser on another machine hears the same voice saying the same phrase, or the same tone when a project has no phrase. A muted project stays silent, as it does here.
 
 Two details that matter: nothing plays on the **first** poll, or opening the page would announce everything that had already finished; and a browser refuses to play audio until a gesture has allowed it, so the sound toggle doubles as that gesture — it plays a silent clip on the click that enables it. The choice is kept in `localStorage`, per device.

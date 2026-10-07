@@ -127,6 +127,10 @@ def main():
     record = {"project": project, "state": state, "event": event,
               "host": platform.node(),          # so two machines' projects cannot collide
               "notification": data.get("notification_type", ""),
+              # Claude Code passes these; recording them lets the panel open the exact
+              # transcript rather than guessing which file belongs to which project
+              "session": data.get("session_id", ""),
+              "transcript": data.get("transcript_path", ""),
               "time": time.time()}
     # argv[2], or VSCODE_PANEL_URL, names a panel on another machine
     url = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("VSCODE_PANEL_URL", "")

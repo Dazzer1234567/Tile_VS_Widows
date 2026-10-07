@@ -413,10 +413,89 @@ def read_statuses():
             if label in out and out[label]["time"] >= when:
                 continue
             out[label] = {"state": d["state"], "time": when, "host": host,
-                          "project": project, "remote": remote, "path": path}
+                          "project": project, "remote": remote, "path": path,
+                          "transcript": d.get("transcript", "")}
         except Exception:
             pass
     return out
+
+
+TRANSCRIPT_TAIL = 400000        # bytes of a transcript to read; they reach megabytes
+TRANSCRIPT_MSGS = 60            # how many messages to hand the page
+
+
+def find_transcript(record):
+    """The .jsonl holding this session's conversation.
+
+    The hook records `transcript_path`, which is exact.  For a record written before
+    that was added, fall back to matching the project against the directory names
+    Claude Code derives from the working directory - underscores become dashes there."""
+    path = record.get("transcript") or ""
+    if path and os.path.isfile(path):
+        return path
+    root = os.path.join(os.path.expanduser("~"), ".claude", "projects")
+    wanted = record["project"].replace("_", "-").lower()
+    best, best_mtime = "", 0
+    try:
+        for name in os.listdir(root):
+            if not name.lower().endswith(wanted):
+                continue
+            for fn in os.listdir(os.path.join(root, name)):
+                if not fn.endswith(".jsonl"):
+                    continue
+                full = os.path.join(root, name, fn)
+                when = os.path.getmtime(full)
+                if when > best_mtime:
+                    best, best_mtime = full, when
+    except OSError:
+        pass
+    return best
+
+
+def read_conversation(path, limit=TRANSCRIPT_MSGS):
+    """The last few turns of a transcript, as [{role, text}].
+
+    Only the words: thinking, tool calls and tool results are dropped, so what comes
+    back reads like the conversation rather than a machine log.  Only the tail of the
+    file is read - these run to megabytes and the page only ever shows the end."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > TRANSCRIPT_TAIL:
+                f.seek(size - TRANSCRIPT_TAIL)
+                f.readline()                    # that seek landed mid-line; drop it
+            raw = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+
+    out = []
+    for line in raw.splitlines():
+        try:
+            entry = json.loads(line)
+        except Exception:
+            continue
+        if entry.get("type") not in ("user", "assistant"):
+            continue
+        message = entry.get("message") or {}
+        role = message.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "\n".join(b.get("text", "") for b in content
+                              if isinstance(b, dict) and b.get("type") == "text")
+        else:
+            text = ""
+        text = text.strip()
+        if not text or text.startswith("<"):    # system reminders and the like
+            continue
+        if out and out[-1]["role"] == role:     # assistants arrive in several pieces
+            out[-1]["text"] += "\n\n" + text
+        else:
+            out.append({"role": role, "text": text})
+    return out[-limit:]
 
 
 def live_projects():
@@ -661,41 +740,62 @@ WEB_PAGE = """<!doctype html>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#18181b">
 <style>
- :root { --bg:#f4f4f5; --fg:#18181b; --card:#ffffff; --line:#d4d4d8; --dim:#71717a; }
+ :root { --bg:#f4f4f5; --fg:#18181b; --card:#ffffff; --line:#d4d4d8; --dim:#71717a;
+         --me:#1f6feb; --them:#e4e4e7; --themfg:#18181b; }
  @media (prefers-color-scheme: dark) {
-   :root { --bg:#18181b; --fg:#f4f4f5; --card:#27272a; --line:#3f3f46; --dim:#a1a1aa; }
+   :root { --bg:#18181b; --fg:#f4f4f5; --card:#27272a; --line:#3f3f46; --dim:#a1a1aa;
+           --me:#1f6feb; --them:#3f3f46; --themfg:#f4f4f5; }
  }
  * { box-sizing:border-box; }
  body { margin:0; background:var(--bg); color:var(--fg);
-        font:15px/1.4 -apple-system,"Segoe UI",system-ui,sans-serif;
+        font:15px/1.45 -apple-system,"Segoe UI",system-ui,sans-serif;
         padding:calc(16px + env(safe-area-inset-top)) 16px
                 calc(16px + env(safe-area-inset-bottom)); }
  h1 { font-size:17px; margin:0 0 4px; font-weight:600; }
  .sub { color:var(--dim); font-size:12px; margin:0 0 12px; }
  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
-         padding:13px 14px; margin-bottom:9px; cursor:pointer;
+         padding:13px 14px; margin-bottom:9px; cursor:pointer; position:relative;
          -webkit-tap-highlight-color:transparent; user-select:none; }
  .working { background:#f0b429; color:#18181b; border-color:#d9a21f; }
  .done    { background:#3ad35a; color:#18181b; border-color:#2fb84c; }
  .waiting { background:#ff5a4d; color:#18181b; border-color:#e5484d; }
- .name { font-weight:600; }
+ .name { font-weight:600; padding-right:30px; }
  .meta { font-size:12px; opacity:.8; margin-top:2px; }
  .empty { color:var(--dim); font-style:italic; }
  .tag { font-size:11px; border:1px solid currentColor; border-radius:4px;
         padding:0 4px; margin-left:6px; opacity:.75; }
- #snd { font:13px/1 inherit; padding:7px 11px; margin-bottom:12px; cursor:pointer;
-        border:1px solid var(--line); border-radius:6px;
-        background:var(--card); color:var(--fg); }
+ .x { position:absolute; top:6px; right:6px; width:30px; height:30px; line-height:30px;
+      text-align:center; border-radius:8px; opacity:.5; font-size:17px; }
+ .x:active { opacity:1; background:rgba(0,0,0,.12); }
+ button { font:13px/1 inherit; padding:8px 12px; cursor:pointer; color:var(--fg);
+          border:1px solid var(--line); border-radius:7px; background:var(--card); }
  #snd.on { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+ #bar { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
+ .msg { max-width:86%; padding:9px 12px; border-radius:14px; margin-bottom:8px;
+        white-space:pre-wrap; overflow-wrap:anywhere; font-size:14px; }
+ .user { background:var(--me); color:#fff; margin-left:auto; border-bottom-right-radius:4px; }
+ .assistant { background:var(--them); color:var(--themfg); border-bottom-left-radius:4px; }
 </style></head><body>
-<h1>Claude sessions</h1>
-<p class="sub" id="sub">connecting...</p>
-<button id="snd">\\ud83d\\udd07 sound off</button>
-<div id="cards"></div>
+
+<div id="list">
+  <h1>Claude sessions</h1>
+  <p class="sub" id="sub">connecting...</p>
+  <div id="bar"><button id="snd"></button></div>
+  <div id="cards"></div>
+</div>
+
+<div id="convo" hidden>
+  <div id="bar"><button onclick="back()">\\u2039 back</button>
+                <span id="who" style="font-weight:600"></span></div>
+  <div id="msgs"></div>
+</div>
+
 <script>
 const AGO = s => s < 60 ? s + "s ago" : s < 3600 ? Math.floor(s/60) + "m ago"
                  : Math.floor(s/3600) + "h ago";
-let seen = {}, primed = false, sound = localStorage.getItem("sound") === "1";
+const esc = t => { const d = document.createElement("div"); d.textContent = t; return d.innerHTML; };
+let seen = {}, primed = false, view = "list", current = null;
+let sound = localStorage.getItem("sound") === "1";
 const btn = document.getElementById("snd");
 
 function paintBtn() {
@@ -715,38 +815,60 @@ function say(label) {
   new Audio("api/sound?label=" + encodeURIComponent(label) + "&t=" + Date.now())
     .play().catch(() => {});
 }
-async function ack(label) {
+async function clear(ev, label) {
+  ev.stopPropagation();                 // the \\u00d7 clears; tapping the card opens it
   await fetch("api/ack", {method:"POST", headers:{"Content-Type":"application/json"},
                           body: JSON.stringify({label})});
   tick();
+}
+function back() {
+  view = "list"; current = null;
+  document.getElementById("convo").hidden = true;
+  document.getElementById("list").hidden = false;
+  tick();
+}
+async function open_(label) {
+  view = "convo"; current = label;
+  document.getElementById("list").hidden = true;
+  document.getElementById("convo").hidden = false;
+  document.getElementById("who").textContent = label;
+  document.getElementById("msgs").innerHTML = '<p class="empty">loading...</p>';
+  let d;
+  try { d = await (await fetch("api/conversation?label=" + encodeURIComponent(label),
+                               {cache:"no-store"})).json(); }
+  catch (e) { document.getElementById("msgs").innerHTML = '<p class="empty">could not load it</p>'; return; }
+  document.getElementById("msgs").innerHTML = d.messages.length
+    ? d.messages.map(m => '<div class="msg ' + m.role + '">' + esc(m.text) + '</div>').join("")
+    : '<p class="empty">' + esc(d.note || "nothing to show") + '</p>';
+  window.scrollTo(0, document.body.scrollHeight);
 }
 async function tick() {
   let d;
   try { d = await (await fetch("api/cards", {cache:"no-store"})).json(); }
   catch (e) { document.getElementById("sub").textContent = "panel unreachable"; return; }
-  document.getElementById("sub").textContent =
-    "on " + d.host + " \\u00b7 " + d.cards.length + " session" +
-    (d.cards.length === 1 ? "" : "s") + " \\u00b7 tap a card to clear it";
   for (const c of d.cards) {
     // only a NEW event counts, and never on the first load, or opening the page
     // would announce everything that had already finished
-    if (primed && sound && !c.muted && c.state === "done" && seen[c.label] !== c.time) {
-      say(c.label);
-    }
+    if (primed && sound && !c.muted && c.state === "done" && seen[c.label] !== c.time) say(c.label);
     seen[c.label] = c.time;
   }
   primed = true;
+  if (view !== "list") return;
+  document.getElementById("sub").textContent =
+    "on " + d.host + " \\u00b7 " + d.cards.length + " session" +
+    (d.cards.length === 1 ? "" : "s") + " \\u00b7 tap to read, \\u00d7 to clear";
   const box = document.getElementById("cards");
   if (!d.cards.length) { box.innerHTML = '<p class="empty">nothing reporting</p>'; return; }
-  box.innerHTML = d.cards.map(c =>
-    '<div class="card ' + c.state + '" onclick="ack(' + JSON.stringify(c.label).replace(/"/g,"&quot;") + ')">' +
+  box.innerHTML = d.cards.map(c => {
+    const q = JSON.stringify(c.label).replace(/"/g, "&quot;");
+    return '<div class="card ' + c.state + '" onclick="open_(' + q + ')">' +
+      '<div class="x" onclick="clear(event,' + q + ')">\\u00d7</div>' +
       '<div class="name">' + esc(c.project) +
         (c.remote ? '<span class="tag">' + esc(c.host) + '</span>' : '') + '</div>' +
       '<div class="meta">' + c.state + " \\u00b7 " + AGO(c.age) +
-        (c.phrase ? " \\u00b7 \\u201c" + esc(c.phrase) + "\\u201d" : "") + '</div>' +
-    '</div>').join("");
+        (c.phrase ? " \\u00b7 \\u201c" + esc(c.phrase) + "\\u201d" : "") + '</div></div>';
+  }).join("");
 }
-function esc(t) { const d = document.createElement("div"); d.textContent = t; return d.innerHTML; }
 tick(); setInterval(tick, 2000);
 </script></body></html>
 """
@@ -768,6 +890,22 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
         route = self.path.split("?")[0].rstrip("/") or "/"
         if route in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", WEB_PAGE.encode("utf-8"))
+        elif route == "/api/conversation":
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            label = (query.get("label") or [""])[0]
+            record = read_statuses().get(label)
+            body = {"label": label, "messages": [], "note": ""}
+            if not record:
+                body["note"] = "that session is no longer reporting"
+            elif record["remote"]:
+                body["note"] = "the transcript for this one lives on %s" % record["host"]
+            else:
+                path = find_transcript(record)
+                if path:
+                    body["messages"] = read_conversation(path)
+                if not body["messages"]:
+                    body["note"] = "no transcript found for this session yet"
+            self._send(200, "application/json", json.dumps(body).encode("utf-8"))
         elif route == "/icon.png":
             self._send(200, "image/png", icon_png())
         elif route == "/api/sound":
