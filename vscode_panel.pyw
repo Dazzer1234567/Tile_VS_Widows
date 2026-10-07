@@ -1795,10 +1795,13 @@ class Panel(tk.Tk):
             if not (state == "done" and text and speak(text, self.volume)):
                 play_alert(state, self.volume)
         if self.push_url and state == "done" and project not in self.muted:
+            # Siri reads the title and body aloud, so both have to be words rather than
+            # an identifier: "Tile_VS_Widows" is announced letter by letter
             spoken = self.say.get(project, "").strip()
+            name = record["project"] if record else project
             threading.Thread(target=push,
-                             args=(self.push_url, project,
-                                   spoken or "%s has finished" % project),
+                             args=(self.push_url, name.replace("_", " "),
+                                   spoken or "has finished"),
                              daemon=True).start()
 
         if (record or {}).get("remote"):
