@@ -774,7 +774,12 @@ class StatusHandler(http.server.BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             label = (query.get("label") or [""])[0]
             try:
-                self._send(200, "audio/wav", sound_bytes(label))
+                audio = sound_bytes(label)
+                # logged because it is the only way to tell, from this end, whether a
+                # browser actually tried to speak - the alternative is guessing
+                log("web audio for %r requested by %s (%d bytes)"
+                    % (label, self.client_address[0], len(audio)))
+                self._send(200, "audio/wav", audio)
             except Exception as exc:
                 log("could not build audio for %r: %r" % (label, exc))
                 self._send(404, "text/plain; charset=utf-8", b"no audio")
