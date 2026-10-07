@@ -151,6 +151,15 @@ Status files were never cleaned up, so they accumulated for months. The panel hi
 
 `prune_dead()` does nothing when it finds *no* windows at all, rather than concluding everything is dead — otherwise a transient enumeration failure, or running before the desktop is up, would delete every live record.
 
+### Phone notifications
+A web page cannot reach you once you leave it — iOS suspends it the moment another app comes forward, and it cannot wake itself to speak. The only mechanism that does is a push notification, so `push()` POSTs to an [ntfy](https://ntfy.sh) topic whenever a session finishes.
+
+The request goes **out** from this machine, so the phone needs no VPN, no Tailscale and no inbound access: it works on mobile data anywhere. With iOS *Announce Notifications* enabled for headphones, Siri reads the title and body aloud through AirPods — the voice in your ear — and without them it is the ordinary notification sound and banner.
+
+The topic name is the only thing protecting it, so it is generated long and random and kept in `prefs.json`, which lives outside the repo. Anyone who learns the topic can read your notifications or send you fake ones; regenerate it by changing `push_url` there.
+
+It fires for remote sessions too, since the push happens before the early return that skips the app restart for them — a conversation finishing on the other machine is exactly the kind you are not sitting in front of. A muted project is skipped, and the push runs on its own thread so a slow network never holds up the panel.
+
 ### The log
 `%APPDATA%\vscode_panel\panel.log` records panel startup (with PID and whether it is elevated), every finish that queues a restart, and then each round of the sweep: every candidate process, *why* it matched, how many windows it was asked to close, and whether terminating it succeeded. A process that cannot be opened is called out explicitly, with the likely reason — an elevated app cannot be managed by a panel that is not. It rolls to `panel.log.1` past `LOG_MAX_BYTES`, and every logging failure is swallowed: logging must never break the panel.
 

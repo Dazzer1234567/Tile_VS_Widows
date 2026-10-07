@@ -36,6 +36,7 @@ import struct
 import subprocess
 import tempfile
 import urllib.parse
+import urllib.request
 import threading
 import time
 import wave
@@ -67,6 +68,7 @@ REMOTE_SSH = ["hal-daw"]                 # ssh targets to PULL status from, for 
 REMOTE_POLL_S = 2                        # how often the remote end re-reads its own files
 REMOTE_RETRY_S = 20                      # wait before reconnecting to a target that dropped
 STALE_AFTER_S = 6 * 3600                 # a remote record older than this is treated as dead
+PUSH_TIMEOUT = 8                         # seconds; a push must never hold up the panel
 SOUND_ON, SOUND_OFF = "🔊", "🔇"     # speaker / muted speaker
 SOUND_ON_BG, SOUND_OFF_BG = "#1f6feb", "#e5484d"      # blue when sounding, red when muted
 SOUND_FONT = ("Segoe UI Emoji", 12)      # speaker on a card
@@ -579,7 +581,7 @@ def read_prefs():
     """Everything the panel remembers between runs, as one dict.  A dict rather than a
     tuple because every new setting was changing the signature and all five call sites."""
     d = {"muted": set(), "say": {}, "run": {}, "run_off": set(),
-         "volume": VOLUME_DEFAULT, "vol_open": False}
+         "volume": VOLUME_DEFAULT, "vol_open": False, "push_url": ""}
     try:
         with open(PREFS_PATH) as f:
             raw = json.load(f)
@@ -589,6 +591,7 @@ def read_prefs():
         d["run_off"] = set(raw.get("run_off", []))
         d["volume"] = max(0, min(100, int(raw.get("volume", VOLUME_DEFAULT))))
         d["vol_open"] = bool(raw.get("vol_open", False))
+        d["push_url"] = str(raw.get("push_url", ""))
     except Exception:
         pass                        # first run, or an unreadable file: use the defaults
     return d
@@ -600,7 +603,7 @@ def write_prefs(d):
         with open(PREFS_PATH, "w") as f:
             json.dump({"muted": sorted(d["muted"]), "say": d["say"], "run": d["run"],
                        "run_off": sorted(d["run_off"]), "volume": d["volume"],
-                       "vol_open": d["vol_open"]}, f)
+                       "vol_open": d["vol_open"], "push_url": d["push_url"]}, f)
     except Exception:
         pass                        # a preference is not worth crashing the panel over
 
@@ -693,6 +696,28 @@ def icon_png(size=180):
            + chunk(b"IEND", b""))
     ICON_CACHE[size] = png
     return png
+
+
+def push(url, title, body):
+    """Send a phone notification.
+
+    This is the only thing that reaches a phone with another app open, or locked, or
+    away from home: a web page is suspended by iOS the moment you leave it, and cannot
+    wake itself to speak.  The request goes OUT from here, so the phone needs no VPN,
+    no Tailscale and no inbound access - it works on mobile data anywhere.
+
+    With iOS "Announce Notifications" turned on for headphones, Siri reads the title and
+    body aloud through AirPods, which is the voice in your ear; without them it is the
+    ordinary notification sound and banner."""
+    try:
+        request = urllib.request.Request(
+            url, data=body.encode("utf-8"), method="POST",
+            headers={"Title": title.encode("utf-8").decode("latin-1", "replace"),
+                     "Priority": "default", "Tags": "white_check_mark"})
+        urllib.request.urlopen(request, timeout=PUSH_TIMEOUT).close()
+        log("pushed to phone: %s - %s" % (title, body))
+    except Exception as exc:
+        log("push failed: %r" % (exc,))
 
 
 def sound_bytes(label):
@@ -1370,6 +1395,7 @@ class Panel(tk.Tk):
         self.muted, self.say, self.run = prefs["muted"], prefs["say"], prefs["run"]
         self.run_off, self.volume = prefs["run_off"], prefs["volume"]
         self.vol_open = prefs["vol_open"]
+        self.push_url = prefs["push_url"]
         self._vol_job = None                # pending debounced save of the volume
         self._jobs = {}                     # pending debounced saves, per text field
 
@@ -1454,7 +1480,7 @@ class Panel(tk.Tk):
         """Write every remembered setting.  One place, so a new one needs no new callers."""
         write_prefs({"muted": self.muted, "say": self.say, "run": self.run,
                      "run_off": self.run_off, "volume": self.volume,
-                     "vol_open": self.vol_open})
+                     "vol_open": self.vol_open, "push_url": self.push_url})
 
     def panel_hwnd(self):
         self.update_idletasks()
@@ -1768,6 +1794,13 @@ class Panel(tk.Tk):
             # the phrase is for "it has stopped"; red keeps its own falling tone
             if not (state == "done" and text and speak(text, self.volume)):
                 play_alert(state, self.volume)
+        if self.push_url and state == "done" and project not in self.muted:
+            spoken = self.say.get(project, "").strip()
+            threading.Thread(target=push,
+                             args=(self.push_url, project,
+                                   spoken or "%s has finished" % project),
+                             daemon=True).start()
+
         if (record or {}).get("remote"):
             return                      # the app, if any, lives on the other machine
         if state == "done" and project not in self.run_off:
